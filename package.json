@@ -1,0 +1,24 @@
+{
+  "name": "uktio-backend",
+  "version": "1.0.0",
+  "description": "Uktio backend — auth + profile only. Voice traffic (BYOK) goes device-to-Gemini directly, never through this server.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@sentry/node": "^10.69.0",
+    "@supabase/supabase-js": "^2.45.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^8.3.0",
+    "ioredis": "^6.0.0",
+    "morgan": "^1.10.0",
+    "openai": "^4.79.0",
+    "rate-limit-redis": "^4.3.1"
+  }
+}
