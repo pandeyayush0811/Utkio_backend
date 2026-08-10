@@ -80,7 +80,38 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'capacitor://localhost,i
   .map((o) => o.trim())
   .filter(Boolean);
 
-app.use(helmet());
+// Default helmet CSP is `script-src 'self'` etc — this SILENTLY blocked
+// both the checkout page's own script/style tags *and* Razorpay's
+// checkout.js SDK (loaded from checkout.razorpay.com), because neither
+// matched the default allowlist. Symptom in production: the hosted
+// /checkout.html page opened fine (static HTML/CSS painted) but froze
+// forever on "Loading your order..." — the JS that fetches the order
+// and opens the Razorpay widget never ran, and it failed *silently*
+// (browsers don't surface CSP violations to users, only to devtools
+// console). This explicit policy allows exactly what checkout.html
+// needs and nothing else. checkout.html itself now uses only external
+// same-origin <script src="/checkout.js"> / <link href="/checkout.css">
+// files (no inline <script>/<style>), so we don't need 'unsafe-inline'
+// anywhere — keeps the rest of the CSP strict.
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", 'https://checkout.razorpay.com'],
+      styleSrc: ["'self'"],
+      // Razorpay's widget opens payment/OTP/UPI flows inside iframes it
+      // injects itself, hits its own API for order/payment status, and
+      // loads its own images/fonts — all from *.razorpay.com.
+      frameSrc: ["'self'", 'https://api.razorpay.com', 'https://checkout.razorpay.com'],
+      connectSrc: ["'self'", 'https://api.razorpay.com', 'https://lumberjack.razorpay.com'],
+      imgSrc: ["'self'", 'data:', 'https://*.razorpay.com'],
+      fontSrc: ["'self'", 'https://checkout.razorpay.com'],
+      objectSrc: ["'none'"],
+      baseUri: ["'self'"],
+      formAction: ["'self'"]
+    }
+  }
+}));
 app.use(cors({
   origin(origin, callback) {
     // No Origin header at all (native HTTP clients, curl, server-to-
