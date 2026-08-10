@@ -5,6 +5,7 @@ const { requireAuth } = require('../middleware/authMiddleware');
 const { supabaseAdmin } = require('../lib/supabaseClient');
 const { razorpay } = require('../lib/razorpayClient');
 const { TRIAL_DAYS, TRIAL_CHAT_LIMIT, TRIAL_REPORT_LIMIT } = require('../lib/accessLimits');
+const { verifyHmacSignature } = require('../lib/verifySignature');
 
 // Only Starter is actually purchasable right now — Unlimited is
 // waitlist-only (see POST /unlimited/waitlist below). Adding Unlimited
@@ -93,13 +94,15 @@ router.post('/verify', requireAuth, async (req, res, next) => {
     // "order_id|payment_id" using your key SECRET (never the publishable
     // key_id). This is what proves the payment success message actually
     // came from Razorpay and wasn't just faked by someone calling this
-    // endpoint directly with made-up IDs.
-    const expectedSignature = crypto
-      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
-      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
-      .digest('hex');
+    // endpoint directly with made-up IDs. Timing-safe compare — see
+    // lib/verifySignature.js for why a plain !== isn't used here.
+    const validSignature = verifyHmacSignature({
+      secret: process.env.RAZORPAY_KEY_SECRET,
+      payload: `${razorpay_order_id}|${razorpay_payment_id}`,
+      providedSignature: razorpay_signature
+    });
 
-    if (expectedSignature !== razorpay_signature) {
+    if (!validSignature) {
       return res.status(400).json({ error: 'Invalid payment signature.' });
     }
 
@@ -147,12 +150,13 @@ router.post('/webhook', async (req, res, next) => {
     if (!supabaseAdmin) return res.status(500).send('Server misconfigured');
 
     const signature = req.headers['x-razorpay-signature'];
-    const expectedSignature = crypto
-      .createHmac('sha256', process.env.RAZORPAY_WEBHOOK_SECRET)
-      .update(req.rawBody || Buffer.from(JSON.stringify(req.body)))
-      .digest('hex');
+    const validSignature = verifyHmacSignature({
+      secret: process.env.RAZORPAY_WEBHOOK_SECRET,
+      payload: req.rawBody || Buffer.from(JSON.stringify(req.body)),
+      providedSignature: signature
+    });
 
-    if (!signature || signature !== expectedSignature) {
+    if (!validSignature) {
       console.error('Webhook signature mismatch — rejecting (possible spoofed request).');
       return res.status(400).send('Invalid signature');
     }
@@ -192,19 +196,45 @@ router.post('/webhook', async (req, res, next) => {
 // guard below (an already-'paid' row just gets skipped, not
 // re-processed / re-dated).
 async function activatePlan({ payment, razorpay_payment_id }) {
-  // Idempotency guard: if this order was already marked paid (by
-  // whichever of /verify or the webhook got here first), don't do it
-  // again — re-running this would push plan_expires_at another 30 days
-  // into the future for a SINGLE payment, effectively giving the user
-  // free extra time.
-  if (payment.status === 'paid') return;
+  // Idempotency guard — MUST be atomic, not a separate read-then-write.
+  //
+  // /verify (client) and /webhook (Razorpay server) can both call this
+  // for the same order within milliseconds of each other. A plain
+  // "if (payment.status === 'paid') return" here checks a *value read
+  // earlier* (before this function was even called) — it doesn't stop
+  // two concurrent calls that both read status = 'created' from racing
+  // each other, both passing the check, and both running the plan
+  // update below. Result: plan_expires_at gets pushed forward twice for
+  // one payment, i.e. free extra validity days.
+  //
+  // Fix: fold the "still created?" check into the UPDATE itself as a
+  // single atomic statement (`WHERE status = 'created'`). Postgres
+  // guarantees only one concurrent UPDATE can win that WHERE clause for
+  // a given row — the loser's WHERE simply matches 0 rows. We use that
+  // return count to detect "someone else already handled this" and
+  // bail out before ever touching profiles.
+  const { data: updatedPayment, error: updateErr } = await supabaseAdmin
+    .from('payments')
+    .update({ status: 'paid', razorpay_payment_id, paid_at: new Date().toISOString() })
+    .eq('id', payment.id)
+    .eq('status', 'created') // <-- the atomic guard: only succeeds if still unclaimed
+    .select()
+    .maybeSingle();
 
-  const validityDays = PLAN_VALIDITY_DAYS[payment.plan] || 30;
+  if (updateErr) throw updateErr;
+  if (!updatedPayment) {
+    // 0 rows matched: either already 'paid' (the race we're guarding
+    // against — the other caller won) or already 'failed'. Either way,
+    // this call has nothing left to do.
+    return;
+  }
+
+  const validityDays = PLAN_VALIDITY_DAYS[updatedPayment.plan] || 30;
 
   const { data: profile } = await supabaseAdmin
     .from('profiles')
     .select('plan, plan_expires_at')
-    .eq('id', payment.user_id)
+    .eq('id', updatedPayment.user_id)
     .single();
 
   // Renewing before expiry extends from the CURRENT expiry date, not
@@ -216,14 +246,9 @@ async function activatePlan({ payment, razorpay_payment_id }) {
   const newExpiry = new Date(base.getTime() + validityDays * 24 * 60 * 60 * 1000);
 
   await supabaseAdmin
-    .from('payments')
-    .update({ status: 'paid', razorpay_payment_id, paid_at: new Date().toISOString() })
-    .eq('id', payment.id);
-
-  await supabaseAdmin
     .from('profiles')
-    .update({ plan: payment.plan, plan_expires_at: newExpiry.toISOString() })
-    .eq('id', payment.user_id);
+    .update({ plan: updatedPayment.plan, plan_expires_at: newExpiry.toISOString() })
+    .eq('id', updatedPayment.user_id);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -361,12 +386,13 @@ router.post('/checkout/:token/verify', async (req, res, next) => {
       return res.status(400).json({ error: 'Order mismatch.' });
     }
 
-    const expectedSignature = crypto
-      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
-      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
-      .digest('hex');
+    const validSignature = verifyHmacSignature({
+      secret: process.env.RAZORPAY_KEY_SECRET,
+      payload: `${razorpay_order_id}|${razorpay_payment_id}`,
+      providedSignature: razorpay_signature
+    });
 
-    if (expectedSignature !== razorpay_signature) {
+    if (!validSignature) {
       return res.status(400).json({ error: 'Invalid payment signature.' });
     }
 

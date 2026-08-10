@@ -195,8 +195,15 @@ begin
 
   return query select
     v_paid,
-    (not v_paid) and now() <= v_trial_deadline
-      and v_chats_used < p_trial_limit_chats and v_reports_used < p_trial_limit_reports,
+    -- FIX: trial_active must mean "is the trial window itself still
+    -- live" (time-wise), NOT "does the user have credits left in
+    -- BOTH independent counters". consume_access() gates chat and
+    -- report access completely independently (see its comment above),
+    -- so a user who has used all 5 free reports but 0 of 5 free chats
+    -- can still successfully consume_access('chat') — this flag must
+    -- agree with that, or GET /payments/status shows a paywall for a
+    -- user who can actually still start a free chat right now.
+    (not v_paid) and now() <= v_trial_deadline,
     greatest(0, extract(epoch from (v_trial_deadline - now())) / 86400.0),
     greatest(0, p_trial_limit_chats - v_chats_used),
     greatest(0, p_trial_limit_reports - v_reports_used);
