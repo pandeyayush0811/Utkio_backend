@@ -226,6 +226,162 @@ async function activatePlan({ payment, razorpay_payment_id }) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// BROWSER-BASED CHECKOUT (fixes Razorpay-inside-WebView failures)
+//
+// Flow:
+//   1. App (still authenticated, inside WebView) calls POST /checkout/init.
+//      Backend creates the Razorpay order exactly like /create-order does,
+//      then mints a random single-use token tied to it and returns a
+//      checkout_url pointing at the hosted /checkout.html page.
+//   2. App opens checkout_url in the SYSTEM BROWSER (Capacitor Browser
+//      plugin), not the in-app WebView.
+//   3. checkout.html (unauthenticated, public) calls GET /checkout/:token
+//      to fetch order details, then runs Razorpay's checkout widget —
+//      now in a real browser, where it actually works.
+//   4. On success, checkout.html calls POST /checkout/:token/verify.
+//      Same signature-verification + idempotent activatePlan() as the
+//      in-app flow. Token is burned (single use) either way.
+//   5. The webhook above remains the real source of truth regardless —
+//      if the user closes the browser tab right after paying before step
+//      4 fires, the webhook still activates the plan. This flow is a UX
+//      nicety on top, same relationship /verify already has to /webhook.
+// ═══════════════════════════════════════════════════════════════
+
+const CHECKOUT_TOKEN_TTL_MS = 15 * 60 * 1000; // 15 minutes — plenty for a checkout, short enough to limit exposure if a URL leaks (e.g. shared-clipboard, chat screenshot)
+
+router.post('/checkout/init', requireAuth, async (req, res, next) => {
+  try {
+    if (!razorpay) return res.status(500).json({ error: 'Payments not configured on server.' });
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+
+    const { plan } = req.body;
+    if (!plan || !PLAN_PRICES_PAISE[plan]) {
+      return res.status(400).json({ error: `plan must be one of: ${Object.keys(PLAN_PRICES_PAISE).join(', ')}` });
+    }
+
+    const amount = PLAN_PRICES_PAISE[plan];
+    const receipt = `${plan}_${req.user.id}_${Date.now()}`.slice(0, 40);
+
+    const order = await razorpay.orders.create({
+      amount,
+      currency: 'INR',
+      receipt,
+      notes: { user_id: req.user.id, plan, via: 'browser_checkout' }
+    });
+
+    const { data: paymentRow, error: insertError } = await supabaseAdmin
+      .from('payments')
+      .insert({
+        user_id: req.user.id,
+        plan,
+        amount_paise: amount,
+        currency: 'INR',
+        razorpay_order_id: order.id,
+        status: 'created'
+      })
+      .select('id')
+      .single();
+    if (insertError) return next(insertError);
+
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + CHECKOUT_TOKEN_TTL_MS).toISOString();
+
+    const { error: tokenError } = await supabaseAdmin.from('checkout_tokens').insert({
+      token,
+      payment_id: paymentRow.id,
+      user_id: req.user.id,
+      expires_at: expiresAt
+    });
+    if (tokenError) return next(tokenError);
+
+    // req.get('host') respects the real public host even behind Render's
+    // proxy (works together with app.set('trust proxy', 1) in index.js).
+    const baseUrl = `${req.protocol}://${req.get('host')}`;
+    res.json({ checkout_url: `${baseUrl}/checkout.html?token=${token}` });
+  } catch (err) { next(err); }
+});
+
+// Looks up a checkout token and returns { row, payment } if valid, or
+// null if missing/expired/already used. Shared by the two routes below
+// so the "is this token still good" logic lives in exactly one place.
+async function resolveCheckoutToken(token) {
+  const { data: row } = await supabaseAdmin
+    .from('checkout_tokens')
+    .select('*, payments(*)')
+    .eq('token', token)
+    .maybeSingle();
+
+  if (!row) return null;
+  if (row.used_at) return null;
+  if (new Date(row.expires_at) < new Date()) return null;
+  if (!row.payments) return null; // payment row was somehow deleted — treat as invalid
+
+  return { row, payment: row.payments };
+}
+
+// GET /payments/checkout/:token — public (no Authorization header; the
+// token itself IS the auth, scoped to exactly one pending order).
+router.get('/checkout/:token', async (req, res, next) => {
+  try {
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured.' });
+
+    const resolved = await resolveCheckoutToken(req.params.token);
+    if (!resolved) return res.status(410).json({ error: 'This checkout link has expired or was already used. Go back to the app and try again.' });
+
+    const { payment } = resolved;
+    res.json({
+      order_id: payment.razorpay_order_id,
+      amount: payment.amount_paise,
+      currency: payment.currency,
+      plan: payment.plan,
+      key_id: process.env.RAZORPAY_KEY_ID
+    });
+  } catch (err) { next(err); }
+});
+
+// POST /payments/checkout/:token/verify — public, called by checkout.html
+// right after Razorpay's widget reports success in the browser.
+router.post('/checkout/:token/verify', async (req, res, next) => {
+  try {
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured.' });
+    if (!process.env.RAZORPAY_KEY_SECRET) return res.status(500).json({ error: 'Payments not configured on server.' });
+
+    const resolved = await resolveCheckoutToken(req.params.token);
+    if (!resolved) return res.status(410).json({ error: 'This checkout link has expired or was already used.' });
+
+    const { row, payment } = resolved;
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({ error: 'razorpay_order_id, razorpay_payment_id and razorpay_signature are all required' });
+    }
+    // The token was minted for one specific order — refuse to let it
+    // verify a *different* order_id than the one it was issued for.
+    if (razorpay_order_id !== payment.razorpay_order_id) {
+      return res.status(400).json({ error: 'Order mismatch.' });
+    }
+
+    const expectedSignature = crypto
+      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest('hex');
+
+    if (expectedSignature !== razorpay_signature) {
+      return res.status(400).json({ error: 'Invalid payment signature.' });
+    }
+
+    await activatePlan({ payment, razorpay_payment_id });
+
+    // Burn the token — single use, regardless of what happens next.
+    await supabaseAdmin
+      .from('checkout_tokens')
+      .update({ used_at: new Date().toISOString() })
+      .eq('token', row.token);
+
+    res.json({ status: 'active', plan: payment.plan });
+  } catch (err) { next(err); }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // GET /payments/status — frontend calls this to decide what to show
 // (paywall vs. app, "renew" banner near expiry, etc.)
 // ═══════════════════════════════════════════════════════════════

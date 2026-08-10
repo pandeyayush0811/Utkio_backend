@@ -110,6 +110,14 @@ app.use(generalLimiter);
 
 app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 
+// Serves public/checkout.html — the hosted Razorpay checkout page opened
+// in the SYSTEM BROWSER (not the app's WebView) via
+// POST /payments/checkout/init. Static, unauthenticated by design (see
+// sql/migrations/003_checkout_tokens.sql for why). Nothing else in
+// public/ is expected to exist; this only ever serves that one page (and
+// its own inline script), so it can't accidentally expose anything else.
+app.use(express.static(require('path').join(__dirname, 'public')));
+
 app.use('/auth', authLimiter, authRoutes);
 // writeLimiter only kicks in for POST/PATCH — GETs (like /users/me,
 // /chat/sessions) stay under the general limiter only.
