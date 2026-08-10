@@ -1,48 +1,77 @@
 const { supabaseAdmin } = require('../lib/supabaseClient');
+const { TRIAL_DAYS, TRIAL_CHAT_LIMIT, TRIAL_REPORT_LIMIT } = require('../lib/accessLimits');
 
-// Protects a route that requires an active paid plan (Starter or
-// Unlimited). Must run AFTER requireAuth (needs req.user.id already set).
+// Protects a route that costs backend money: saving a chat session or
+// generating a report/quiz (analyze). Must run AFTER requireAuth (needs
+// req.user.id already set).
 //
-// Checks profiles.plan/plan_expires_at directly — NOT the payments
-// table. profiles.plan is the single source of truth for "is this user
-// currently allowed in"; payments is just the audit trail of how they
-// got there. Keeping the check to one column read (already indexed)
-// keeps this cheap enough to run on every gated request.
-async function requirePlan(req, res, next) {
-  try {
-    if (!supabaseAdmin) {
-      return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
-    }
+// Access is granted if EITHER is true:
+//   1. profiles.plan is an active, non-expired paid plan (starter/unlimited)
+//      — unchanged from before, still fully uncapped.
+//   2. The user is within their free trial window (TRIAL_DAYS from signup)
+//      AND still has credits left for this specific kind of action
+//      (TRIAL_CHAT_LIMIT for 'chat', TRIAL_REPORT_LIMIT for 'report' —
+//      two independent counters, not a shared pool).
+//
+// The check-and-increment for (2) happens atomically in Postgres via
+// consume_access() (see migrations/004_trial_and_usage_limits.sql) so a
+// user firing two requests at once can't both consume the same last
+// credit — a plain "select count then update" here in JS would race.
+//
+// requirePlan('chat') and requirePlan('report') are the two call sites
+// today (POST /chat/sessions and POST /chat/sessions/:id/analyze).
+// Reading already-generated data (history, report, mistakes/quiz review)
+// is intentionally NEVER gated by this — it's a free read of something
+// already paid for once at generation time.
+function requirePlan(kind) {
+  if (kind !== 'chat' && kind !== 'report') {
+    throw new Error(`requirePlan(kind): kind must be 'chat' or 'report', got ${JSON.stringify(kind)}`);
+  }
 
-    const { data, error } = await supabaseAdmin
-      .from('profiles')
-      .select('plan, plan_expires_at')
-      .eq('id', req.user.id)
-      .single();
+  return async function (req, res, next) {
+    try {
+      if (!supabaseAdmin) {
+        return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+      }
 
-    if (error || !data) {
-      return res.status(500).json({ error: 'Could not verify plan status.' });
-    }
-
-    const hasPlan = data.plan && data.plan !== 'none';
-    // NULL plan_expires_at = no expiry (reserved for a future lifetime/
-    // comped plan) — Starter always has a real expiry set by
-    // paymentRoutes.js, so in practice this branch only matters for
-    // plans that are meant to never expire.
-    const notExpired = !data.plan_expires_at || new Date(data.plan_expires_at) > new Date();
-
-    if (!hasPlan || !notExpired) {
-      return res.status(402).json({
-        error: 'active_plan_required',
-        message: hasPlan
-          ? 'Tumhara plan expire ho gaya hai — renew karo practice jaari rakhne ke liye.'
-          : 'Practice sessions ke liye ek active plan chahiye.'
+      const { data, error } = await supabaseAdmin.rpc('consume_access', {
+        p_user_id: req.user.id,
+        p_kind: kind,
+        p_trial_days: TRIAL_DAYS,
+        p_trial_limit: kind === 'chat' ? TRIAL_CHAT_LIMIT : TRIAL_REPORT_LIMIT
       });
-    }
 
-    req.userPlan = data.plan;
-    next();
-  } catch (err) { next(err); }
+      if (error) return next(error);
+
+      const result = Array.isArray(data) ? data[0] : data;
+      if (!result) return res.status(500).json({ error: 'Could not verify access.' });
+
+      if (!result.allowed) {
+        return res.status(402).json({
+          error: 'active_plan_required',
+          reason: result.reason,
+          message: accessDeniedMessage(result.reason, kind)
+        });
+      }
+
+      req.accessReason = result.reason; // 'paid_plan' or 'trial_ok' — handy in logs
+      next();
+    } catch (err) { next(err); }
+  };
+}
+
+function accessDeniedMessage(reason, kind) {
+  const what = kind === 'chat' ? 'session' : 'report';
+  switch (reason) {
+    case 'trial_expired':
+      return 'Tumhara 3-din ka free trial khatam ho gaya hai — jaari rakhne ke liye plan lo.';
+    case 'trial_limit_reached':
+      return `Tumhare free trial ke ${kind === 'chat' ? TRIAL_CHAT_LIMIT : TRIAL_REPORT_LIMIT} free ${what}s use ho chuke hain — jaari rakhne ke liye plan lo.`;
+    case 'trial_not_started':
+    case 'user_not_found':
+    default:
+      return 'Practice sessions ke liye ek active plan ya free trial chahiye.';
+  }
 }
 
 module.exports = { requirePlan };

@@ -4,6 +4,7 @@ const router = express.Router();
 const { requireAuth } = require('../middleware/authMiddleware');
 const { supabaseAdmin } = require('../lib/supabaseClient');
 const { razorpay } = require('../lib/razorpayClient');
+const { TRIAL_DAYS, TRIAL_CHAT_LIMIT, TRIAL_REPORT_LIMIT } = require('../lib/accessLimits');
 
 // Only Starter is actually purchasable right now — Unlimited is
 // waitlist-only (see POST /unlimited/waitlist below). Adding Unlimited
@@ -396,8 +397,38 @@ router.get('/status', requireAuth, async (req, res, next) => {
       .single();
     if (error) return next(error);
 
-    const active = data.plan !== 'none' && (!data.plan_expires_at || new Date(data.plan_expires_at) > new Date());
-    res.json({ plan: data.plan, plan_expires_at: data.plan_expires_at, active });
+    const hasPaidPlan = data.plan !== 'none' && (!data.plan_expires_at || new Date(data.plan_expires_at) > new Date());
+
+    // Read-only trial peek (no side effects, safe to poll) — only meaningful
+    // when there's no active paid plan, but we fetch it regardless so the
+    // response shape is stable either way.
+    const { data: trialData, error: trialError } = await supabaseAdmin.rpc('peek_access', {
+      p_user_id: req.user.id,
+      p_trial_days: TRIAL_DAYS,
+      p_trial_limit_chats: TRIAL_CHAT_LIMIT,
+      p_trial_limit_reports: TRIAL_REPORT_LIMIT
+    });
+    if (trialError) return next(trialError);
+    const trial = Array.isArray(trialData) ? trialData[0] : trialData;
+
+    // `active` = "can the user actually use gated features right now"
+    // (unchanged field name/meaning for frontend backward-compat — was
+    // paid-only before, now also true during an in-progress free trial).
+    const active = hasPaidPlan || Boolean(trial && trial.trial_active);
+
+    res.json({
+      plan: data.plan,
+      plan_expires_at: data.plan_expires_at,
+      active,
+      trial: hasPaidPlan ? null : {
+        active: Boolean(trial && trial.trial_active),
+        days_left: trial ? Math.max(0, Math.floor(Number(trial.trial_days_left) * 10) / 10) : 0,
+        chats_remaining: trial ? trial.chats_remaining : 0,
+        reports_remaining: trial ? trial.reports_remaining : 0,
+        chat_limit: TRIAL_CHAT_LIMIT,
+        report_limit: TRIAL_REPORT_LIMIT
+      }
+    });
   } catch (err) { next(err); }
 });
 

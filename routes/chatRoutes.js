@@ -101,7 +101,7 @@ router.get('/sessions/:id', requireAuth, async (req, res, next) => {
 //   - session_id set -> RESUME: appends these turns to an existing
 //                        session (turn_index continues where it left off,
 //                        ended_at + turn_count get updated)
-router.post('/sessions', requireAuth, requirePlan, async (req, res, next) => {
+router.post('/sessions', requireAuth, requirePlan('chat'), async (req, res, next) => {
   try {
     if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
 
@@ -336,7 +336,7 @@ router.get('/sessions/:id/report', requireAuth, async (req, res, next) => {
 // Generates (or returns the already-generated) report for one session.
 // Synchronous — a single transcript is small enough that this finishes
 // in a few seconds, so no job queue/polling is needed for this feature.
-router.post('/sessions/:id/analyze', requireAuth, requirePlan, async (req, res, next) => {
+router.post('/sessions/:id/analyze', requireAuth, requirePlan('report'), async (req, res, next) => {
   try {
     if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
     if (!process.env.OPENAI_API_KEY) return res.status(500).json({ error: 'Server misconfigured: OPENAI_API_KEY missing.' });
