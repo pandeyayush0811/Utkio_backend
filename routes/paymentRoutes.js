@@ -6,16 +6,12 @@ const { supabaseAdmin } = require('../lib/supabaseClient');
 const { razorpay } = require('../lib/razorpayClient');
 const { TRIAL_DAYS, TRIAL_CHAT_LIMIT, TRIAL_REPORT_LIMIT } = require('../lib/accessLimits');
 const { verifyHmacSignature } = require('../lib/verifySignature');
-
-// Only Starter is actually purchasable right now — Unlimited is
-// waitlist-only (see POST /unlimited/waitlist below). Adding Unlimited
-// here later is a one-line addition, not a restructure.
-const PLAN_PRICES_PAISE = {
-  starter: 9900 // ₹99
-};
-const PLAN_VALIDITY_DAYS = {
-  starter: 30
-};
+// PLAN_PRICES_PAISE, PLAN_VALIDITY_DAYS and activatePlan now live in
+// lib/planActivation.js — shared with the reconciliation job (see
+// lib/reconcilePayments.js) so there is exactly one implementation of
+// "what does a captured payment turn into", not two copies that can
+// silently drift apart.
+const { PLAN_PRICES_PAISE, activatePlan } = require('../lib/planActivation');
 
 // ═══════════════════════════════════════════════════════════════
 // POST /payments/create-order
@@ -37,6 +33,35 @@ router.post('/create-order', requireAuth, async (req, res, next) => {
     // chars) — not shown to the user, just useful for cross-referencing
     // in the Razorpay dashboard while debugging.
     const receipt = `${plan}_${req.user.id}_${Date.now()}`.slice(0, 40);
+
+    // Dedup guard: Razorpay's standard Orders API does NOT support an
+    // idempotency key (unlike their Payouts/Refunds/Transfers APIs) —
+    // so a retried/double-tapped call would otherwise create a second
+    // live order. Instead, reuse a still-pending order for this exact
+    // user+plan if one was created in the last DEDUP_WINDOW_MS: this
+    // covers the double-tap/retry case without touching Razorpay's API
+    // at all. A genuinely new purchase attempt after the window (or for
+    // a different plan) still creates a fresh order as before.
+    const dedupSince = new Date(Date.now() - DEDUP_WINDOW_MS).toISOString();
+    const { data: recentPending } = await supabaseAdmin
+      .from('payments')
+      .select('razorpay_order_id, amount_paise, currency')
+      .eq('user_id', req.user.id)
+      .eq('plan', plan)
+      .eq('status', 'created')
+      .gte('created_at', dedupSince)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (recentPending) {
+      return res.json({
+        order_id: recentPending.razorpay_order_id,
+        amount: recentPending.amount_paise,
+        currency: recentPending.currency,
+        key_id: process.env.RAZORPAY_KEY_ID
+      });
+    }
 
     const order = await razorpay.orders.create({
       amount,
@@ -191,66 +216,6 @@ router.post('/webhook', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// Shared by both /verify and /webhook — whichever fires first wins,
-// the other is a harmless no-op thanks to the `status = 'created'`
-// guard below (an already-'paid' row just gets skipped, not
-// re-processed / re-dated).
-async function activatePlan({ payment, razorpay_payment_id }) {
-  // Idempotency guard — MUST be atomic, not a separate read-then-write.
-  //
-  // /verify (client) and /webhook (Razorpay server) can both call this
-  // for the same order within milliseconds of each other. A plain
-  // "if (payment.status === 'paid') return" here checks a *value read
-  // earlier* (before this function was even called) — it doesn't stop
-  // two concurrent calls that both read status = 'created' from racing
-  // each other, both passing the check, and both running the plan
-  // update below. Result: plan_expires_at gets pushed forward twice for
-  // one payment, i.e. free extra validity days.
-  //
-  // Fix: fold the "still created?" check into the UPDATE itself as a
-  // single atomic statement (`WHERE status = 'created'`). Postgres
-  // guarantees only one concurrent UPDATE can win that WHERE clause for
-  // a given row — the loser's WHERE simply matches 0 rows. We use that
-  // return count to detect "someone else already handled this" and
-  // bail out before ever touching profiles.
-  const { data: updatedPayment, error: updateErr } = await supabaseAdmin
-    .from('payments')
-    .update({ status: 'paid', razorpay_payment_id, paid_at: new Date().toISOString() })
-    .eq('id', payment.id)
-    .eq('status', 'created') // <-- the atomic guard: only succeeds if still unclaimed
-    .select()
-    .maybeSingle();
-
-  if (updateErr) throw updateErr;
-  if (!updatedPayment) {
-    // 0 rows matched: either already 'paid' (the race we're guarding
-    // against — the other caller won) or already 'failed'. Either way,
-    // this call has nothing left to do.
-    return;
-  }
-
-  const validityDays = PLAN_VALIDITY_DAYS[updatedPayment.plan] || 30;
-
-  const { data: profile } = await supabaseAdmin
-    .from('profiles')
-    .select('plan, plan_expires_at')
-    .eq('id', updatedPayment.user_id)
-    .single();
-
-  // Renewing before expiry extends from the CURRENT expiry date, not
-  // from today — so paying a few days early never costs the user those
-  // days. Renewing after it already expired (or first purchase) starts
-  // fresh from now.
-  const currentExpiry = profile && profile.plan_expires_at ? new Date(profile.plan_expires_at) : null;
-  const base = currentExpiry && currentExpiry > new Date() ? currentExpiry : new Date();
-  const newExpiry = new Date(base.getTime() + validityDays * 24 * 60 * 60 * 1000);
-
-  await supabaseAdmin
-    .from('profiles')
-    .update({ plan: updatedPayment.plan, plan_expires_at: newExpiry.toISOString() })
-    .eq('id', updatedPayment.user_id);
-}
-
 // ═══════════════════════════════════════════════════════════════
 // BROWSER-BASED CHECKOUT (fixes Razorpay-inside-WebView failures)
 //
@@ -275,6 +240,14 @@ async function activatePlan({ payment, razorpay_payment_id }) {
 
 const CHECKOUT_TOKEN_TTL_MS = 15 * 60 * 1000; // 15 minutes — plenty for a checkout, short enough to limit exposure if a URL leaks (e.g. shared-clipboard, chat screenshot)
 
+// How long a still-'created' payment for the same user+plan is treated
+// as "the same purchase attempt" for dedup purposes (see /create-order
+// and /checkout/init above). Long enough to absorb a slow retry/double
+// tap, short enough that someone who genuinely abandons checkout and
+// comes back later still gets a fresh order rather than being stuck
+// reusing a stale one.
+const DEDUP_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+
 router.post('/checkout/init', requireAuth, async (req, res, next) => {
   try {
     if (!razorpay) return res.status(500).json({ error: 'Payments not configured on server.' });
@@ -287,6 +260,52 @@ router.post('/checkout/init', requireAuth, async (req, res, next) => {
 
     const amount = PLAN_PRICES_PAISE[plan];
     const receipt = `${plan}_${req.user.id}_${Date.now()}`.slice(0, 40);
+
+    // Same dedup guard as /create-order above — see comment there for why
+    // this exists instead of a Razorpay-side idempotency key.
+    const dedupSince = new Date(Date.now() - DEDUP_WINDOW_MS).toISOString();
+    const { data: recentPending } = await supabaseAdmin
+      .from('payments')
+      .select('id, razorpay_order_id')
+      .eq('user_id', req.user.id)
+      .eq('plan', plan)
+      .eq('status', 'created')
+      .gte('created_at', dedupSince)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (recentPending) {
+      const { data: existingToken } = await supabaseAdmin
+        .from('checkout_tokens')
+        .select('token, expires_at')
+        .eq('payment_id', recentPending.id)
+        .is('used_at', null)
+        .gt('expires_at', new Date().toISOString())
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (existingToken) {
+        const baseUrl = `${req.protocol}://${req.get('host')}`;
+        return res.json({ checkout_url: `${baseUrl}/checkout.html?token=${existingToken.token}` });
+      }
+      // Pending order exists but its checkout token already expired —
+      // fall through and mint a fresh token for the SAME order instead
+      // of creating a new Razorpay order.
+      const token = crypto.randomBytes(32).toString('hex');
+      const expiresAt = new Date(Date.now() + CHECKOUT_TOKEN_TTL_MS).toISOString();
+      const { error: tokenError } = await supabaseAdmin.from('checkout_tokens').insert({
+        token,
+        payment_id: recentPending.id,
+        user_id: req.user.id,
+        expires_at: expiresAt
+      });
+      if (tokenError) return next(tokenError);
+
+      const baseUrl = `${req.protocol}://${req.get('host')}`;
+      return res.json({ checkout_url: `${baseUrl}/checkout.html?token=${token}` });
+    }
 
     const order = await razorpay.orders.create({
       amount,

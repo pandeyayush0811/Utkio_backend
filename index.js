@@ -49,6 +49,7 @@ const authRoutes = require('./routes/authRoutes');
 const userRoutes = require('./routes/userRoutes');
 const chatRoutes = require('./routes/chatRoutes');
 const paymentRoutes = require('./routes/paymentRoutes');
+const adminRoutes = require('./routes/adminRoutes');
 
 const app = express();
 // Render (and most PaaS hosts) sit in front of this app as a reverse
@@ -155,6 +156,10 @@ app.use('/auth', authLimiter, authRoutes);
 app.use('/users', (req, res, next) => (req.method === 'GET' ? next() : writeLimiter(req, res, next)), userRoutes);
 app.use('/chat', (req, res, next) => (req.method === 'GET' ? next() : writeLimiter(req, res, next)), chatRoutes);
 app.use('/payments', (req, res, next) => (req.method === 'GET' ? next() : writeLimiter(req, res, next)), paymentRoutes);
+// Uses the general limiter, not writeLimiter — this is an operator/cron
+// endpoint gated by ADMIN_SECRET (see adminRoutes.js), not a per-user
+// action, so the per-user write budget doesn't apply here.
+app.use('/admin', adminRoutes);
 
 app.use(notFoundHandler);
 if (process.env.SENTRY_DSN) Sentry.setupExpressErrorHandler(app); // reports to Sentry, then falls through
@@ -166,3 +171,42 @@ const PORT = process.env.PORT || 3000;
 const server = http.createServer(app);
 
 server.listen(PORT, () => console.log(`Uktio backend listening on port ${PORT}`));
+
+// ═══════════════════════════════════════════════════════════════
+// OPTIONAL in-process payment reconciliation scheduler.
+//
+// Off by default (RECONCILE_INTERVAL_MINUTES unset) — nothing changes
+// for anyone who doesn't opt in. If set, runs
+// reconcilePendingPayments() on that interval so payments Razorpay
+// captured but our webhook + client /verify both missed still get
+// activated automatically, without needing an external cron.
+//
+// Fine for a single-instance deploy (this app's documented deployment
+// target — see README's rate-limiting note). If you run 2+ instances,
+// prefer an external cron hitting POST /admin/reconcile-payments once
+// instead of setting this on every instance — reconcilePendingPayments
+// is safe to call concurrently (same atomic activatePlan() guard as
+// everything else) but there's no reason to have every instance doing
+// duplicate Razorpay API calls on the same schedule.
+// ═══════════════════════════════════════════════════════════════
+const RECONCILE_INTERVAL_MINUTES = Number(process.env.RECONCILE_INTERVAL_MINUTES) || 0;
+if (RECONCILE_INTERVAL_MINUTES > 0) {
+  const { reconcilePendingPayments } = require('./lib/reconcilePayments');
+  console.log(`Payment reconciliation scheduler enabled — running every ${RECONCILE_INTERVAL_MINUTES} minute(s).`);
+
+  const runReconciliation = async () => {
+    try {
+      const summary = await reconcilePendingPayments();
+      if (summary.activated > 0 || summary.errors.length > 0) {
+        console.log('[reconcile] scheduled run:', summary);
+      }
+    } catch (err) {
+      console.error('[reconcile] scheduled run failed:', err);
+    }
+  };
+
+  setInterval(runReconciliation, RECONCILE_INTERVAL_MINUTES * 60 * 1000);
+  // Also run once shortly after boot, so a restart doesn't leave a
+  // long gap before the first check.
+  setTimeout(runReconciliation, 60 * 1000);
+}
