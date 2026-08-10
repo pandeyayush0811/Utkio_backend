@@ -140,7 +140,7 @@ router.post('/onboarding', requireAuth, async (req, res, next) => {
       .select()
       .single();
 
-    if (error) return res.status(500).json({ error: error.message });
+    if (error) return next(error); // 5xx internals stay server-side only — see errorHandler.js
 
     res.json({ profile: data });
   } catch (err) { next(err); }
@@ -168,7 +168,7 @@ router.patch('/profile', requireAuth, async (req, res, next) => {
       .select()
       .single();
 
-    if (error) return res.status(500).json({ error: error.message });
+    if (error) return next(error); // 5xx internals stay server-side only — see errorHandler.js
 
     res.json({ profile: data });
   } catch (err) { next(err); }

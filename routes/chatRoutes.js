@@ -38,7 +38,7 @@ router.get('/sessions', requireAuth, async (req, res, next) => {
       .eq('user_id', req.user.id)
       .order('started_at', { ascending: false });
 
-    if (error) return res.status(500).json({ error: error.message });
+    if (error) return next(error); // 5xx internals stay server-side only — see errorHandler.js
 
     // One extra lightweight query to know which sessions already have a
     // report — avoids an N+1 (one report-check call per card) on the
@@ -77,7 +77,7 @@ router.get('/sessions/:id', requireAuth, async (req, res, next) => {
       .eq('session_id', id)
       .order('turn_index', { ascending: true });
 
-    if (messagesErr) return res.status(500).json({ error: messagesErr.message });
+    if (messagesErr) return next(messagesErr); // 5xx internals stay server-side only — see errorHandler.js
 
     // has_report: same lookup History's list view does (see GET /sessions
     // above) — needed here too now so chat.html can (a) offer the report
@@ -101,7 +101,7 @@ router.get('/sessions/:id', requireAuth, async (req, res, next) => {
 //   - session_id set -> RESUME: appends these turns to an existing
 //                        session (turn_index continues where it left off,
 //                        ended_at + turn_count get updated)
-router.post('/sessions', requireAuth, requirePlan('chat'), async (req, res, next) => {
+router.post('/sessions', requireAuth, async (req, res, next) => {
   try {
     if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
 
@@ -112,74 +112,82 @@ router.post('/sessions', requireAuth, requirePlan('chat'), async (req, res, next
     const msgError = validateMessages(messages);
     if (msgError) return res.status(400).json({ error: msgError });
 
-    // ---- Resume mode: append to an existing session ----
-    if (session_id) {
-      const { data: existing, error: existErr } = await supabaseAdmin
-        .from('chat_sessions')
-        .select('id, turn_count')
-        .eq('id', session_id)
-        .eq('user_id', req.user.id) // ownership check
-        .single();
+    // Body is valid — only NOW check plan/trial access. Doing this before
+    // validation would burn a trial credit on a malformed request that was
+    // never going to succeed (bad timestamp, empty messages, etc.), silently
+    // draining a user's free trial for nothing.
+    requirePlan('chat')(req, res, async () => {
+      try {
+        // ---- Resume mode: append to an existing session ----
+        if (session_id) {
+          const { data: existing, error: existErr } = await supabaseAdmin
+            .from('chat_sessions')
+            .select('id, turn_count')
+            .eq('id', session_id)
+            .eq('user_id', req.user.id) // ownership check
+            .single();
 
-      if (existErr || !existing) return res.status(404).json({ error: 'Session to resume was not found' });
+          if (existErr || !existing) return res.status(404).json({ error: 'Session to resume was not found' });
 
-      // Locked once a report exists: a report is an analysis of the
-      // conversation as it stood at generation time, and this app's design
-      // is that it stays that fixed snapshot — adding more turns after the
-      // fact would silently make the report stale/wrong with no re-analysis
-      // to match. Enforced here (not just hidden in the UI) so this can't
-      // be bypassed by an old cached page, a retried pending sync, or a
-      // direct API call.
-      const { data: reportRow } = await supabaseAdmin
-        .from('session_reports')
-        .select('id')
-        .eq('session_id', session_id)
-        .eq('user_id', req.user.id)
-        .maybeSingle();
-      if (reportRow) {
-        return res.status(409).json({ error: 'locked', message: 'Iss chat ka report ban chuka hai — ab isme naye messages nahi jud sakte. Naya chat shuru karo.' });
-      }
+          // Locked once a report exists: a report is an analysis of the
+          // conversation as it stood at generation time, and this app's design
+          // is that it stays that fixed snapshot — adding more turns after the
+          // fact would silently make the report stale/wrong with no re-analysis
+          // to match. Enforced here (not just hidden in the UI) so this can't
+          // be bypassed by an old cached page, a retried pending sync, or a
+          // direct API call.
+          const { data: reportRow } = await supabaseAdmin
+            .from('session_reports')
+            .select('id')
+            .eq('session_id', session_id)
+            .eq('user_id', req.user.id)
+            .maybeSingle();
+          if (reportRow) {
+            return res.status(409).json({ error: 'locked', message: 'Iss chat ka report ban chuka hai — ab isme naye messages nahi jud sakte. Naya chat shuru karo.' });
+          }
 
-      const startIndex = existing.turn_count;
-      const rows = messages.map((m, i) => ({
-        session_id,
-        role: m.role,
-        content: m.content.trim(),
-        turn_index: startIndex + i
-      }));
+          const startIndex = existing.turn_count;
+          const rows = messages.map((m, i) => ({
+            session_id,
+            role: m.role,
+            content: m.content.trim(),
+            turn_index: startIndex + i
+          }));
 
-      const { error: insertErr } = await supabaseAdmin.from('chat_messages').insert(rows);
-      if (insertErr) return res.status(500).json({ error: insertErr.message });
+          const { error: insertErr } = await supabaseAdmin.from('chat_messages').insert(rows);
+          if (insertErr) return next(insertErr); // 5xx internals stay server-side only — see errorHandler.js
 
-      const newTurnCount = startIndex + rows.length;
-      const { error: updateErr } = await supabaseAdmin
-        .from('chat_sessions')
-        .update({ ended_at, turn_count: newTurnCount })
-        .eq('id', session_id);
+          const newTurnCount = startIndex + rows.length;
+          const { error: updateErr } = await supabaseAdmin
+            .from('chat_sessions')
+            .update({ ended_at, turn_count: newTurnCount })
+            .eq('id', session_id);
 
-      if (updateErr) return res.status(500).json({ error: updateErr.message });
+          if (updateErr) return next(updateErr);
 
-      return res.json({ session_id, turn_count: newTurnCount });
-    }
+          return res.json({ session_id, turn_count: newTurnCount });
+        }
 
-    // ---- Normal mode: brand new session ----
-    const { data: session, error: sessionErr } = await supabaseAdmin
-      .from('chat_sessions')
-      .insert({ user_id: req.user.id, started_at, ended_at, turn_count: messages.length })
-      .select()
-      .single();
+        // ---- Normal mode: brand new session ----
+        const { data: session, error: sessionErr } = await supabaseAdmin
+          .from('chat_sessions')
+          .insert({ user_id: req.user.id, started_at, ended_at, turn_count: messages.length })
+          .select()
+          .single();
 
-    if (sessionErr) return res.status(500).json({ error: sessionErr.message });
+        if (sessionErr) return next(sessionErr);
 
-    const rows = messages.map((m, i) => ({ session_id: session.id, role: m.role, content: m.content.trim(), turn_index: i }));
-    const { error: messagesErr } = await supabaseAdmin.from('chat_messages').insert(rows);
+        const rows = messages.map((m, i) => ({ session_id: session.id, role: m.role, content: m.content.trim(), turn_index: i }));
+        const { error: messagesErr } = await supabaseAdmin.from('chat_messages').insert(rows);
 
-    if (messagesErr) {
-      await supabaseAdmin.from('chat_sessions').delete().eq('id', session.id); // don't leave an orphaned empty session
-      return res.status(500).json({ error: messagesErr.message });
-    }
+        if (messagesErr) {
+          await supabaseAdmin.from('chat_sessions').delete().eq('id', session.id); // don't leave an orphaned empty session
+          return next(messagesErr);
+        }
 
-    res.json({ session_id: session.id, turn_count: rows.length });
+        res.json({ session_id: session.id, turn_count: rows.length });
+      } catch (err) { next(err); }
+    });
   } catch (err) { next(err); }
 });
 
@@ -191,7 +199,7 @@ router.delete('/sessions', requireAuth, async (req, res, next) => {
     if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
 
     const { error } = await supabaseAdmin.from('chat_sessions').delete().eq('user_id', req.user.id);
-    if (error) return res.status(500).json({ error: error.message });
+    if (error) return next(error); // 5xx internals stay server-side only — see errorHandler.js
 
     res.json({ ok: true });
   } catch (err) { next(err); }
@@ -336,16 +344,19 @@ router.get('/sessions/:id/report', requireAuth, async (req, res, next) => {
 // Generates (or returns the already-generated) report for one session.
 // Synchronous — a single transcript is small enough that this finishes
 // in a few seconds, so no job queue/polling is needed for this feature.
-router.post('/sessions/:id/analyze', requireAuth, requirePlan('report'), async (req, res, next) => {
+router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
   try {
     if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
     if (!process.env.OPENAI_API_KEY) return res.status(500).json({ error: 'Server misconfigured: OPENAI_API_KEY missing.' });
 
     const sessionId = req.params.id;
 
-    // Idempotent: if a report already exists, just return it instead of
-    // burning another paid API call (also enforced by the DB's unique
-    // constraint on session_id, this is just the friendly fast-path).
+    // Idempotent fast-path: if a report already exists, just return it —
+    // checked BEFORE spending a trial/plan credit below (see requirePlan
+    // call further down), so re-clicking "generate report" on an
+    // already-reported session is free, not a second charge against the
+    // user's trial. Also enforced by the DB's unique constraint on
+    // session_id — this is just the friendly, credit-safe fast-path.
     const { data: existing } = await supabaseAdmin
       .from('session_reports')
       .select(REPORT_COLUMNS)
@@ -354,7 +365,9 @@ router.post('/sessions/:id/analyze', requireAuth, requirePlan('report'), async (
       .single();
     if (existing) return res.json({ report: existing, already_existed: true });
 
-    // Ownership + fetch messages.
+    // Ownership + min-turns check ALSO happen before requirePlan below —
+    // a request that was never going to succeed (wrong session, or too
+    // few turns) shouldn't cost the user a trial credit either.
     const { data: session, error: sessionErr } = await supabaseAdmin
       .from('chat_sessions')
       .select('id, turn_count')
@@ -367,94 +380,100 @@ router.post('/sessions/:id/analyze', requireAuth, requirePlan('report'), async (
       return res.status(400).json({ error: `Session needs at least ${MIN_TURNS_FOR_ANALYSIS} turns to analyze (has ${session.turn_count}).` });
     }
 
-    // Fetch user's profile — report ko sirf transcript se nahi, balki YE
-    // user kaun hai (naam/age/profession/city/goal) usse bhi personalize
-    // karna hai, bilkul waise hi jaise live chat persona ko bhi profile
-    // pata hota hai.
-    const { data: profile } = await supabaseAdmin
-      .from('profiles')
-      .select('name, age, occupation_type, class_grade, profession, city, goal, self_level')
-      .eq('id', req.user.id)
-      .single();
+    // All pre-checks passed — only NOW check plan/trial access, right
+    // before the actual (paid) OpenAI call.
+    requirePlan('report')(req, res, async () => {
+      try {
+        // Fetch user's profile — report ko sirf transcript se nahi, balki YE
+        // user kaun hai (naam/age/profession/city/goal) usse bhi personalize
+        // karna hai, bilkul waise hi jaise live chat persona ko bhi profile
+        // pata hota hai.
+        const { data: profile } = await supabaseAdmin
+          .from('profiles')
+          .select('name, age, occupation_type, class_grade, profession, city, goal, self_level')
+          .eq('id', req.user.id)
+          .single();
 
-    const { data: messages, error: messagesErr } = await supabaseAdmin
-      .from('chat_messages')
-      .select('role, content, turn_index')
-      .eq('session_id', sessionId)
-      .order('turn_index', { ascending: true });
-    if (messagesErr) return res.status(500).json({ error: messagesErr.message });
+        const { data: messages, error: messagesErr } = await supabaseAdmin
+          .from('chat_messages')
+          .select('role, content, turn_index')
+          .eq('session_id', sessionId)
+          .order('turn_index', { ascending: true });
+        if (messagesErr) return next(messagesErr);
 
-    const transcript = messages.map(m => (m.role === 'user' ? 'User' : 'Bolo') + ': ' + m.content).join('\n');
-    const systemPrompt = (await getAnalysisPrompt()) + buildPersonalizationBlock(profile);
+        const transcript = messages.map(m => (m.role === 'user' ? 'User' : 'Bolo') + ': ' + m.content).join('\n');
+        const systemPrompt = (await getAnalysisPrompt()) + buildPersonalizationBlock(profile);
 
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    const model = ANALYSIS_MODEL;
+        const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+        const model = ANALYSIS_MODEL;
 
-    let parsed;
-    try {
-      const response = await openai.chat.completions.create({
-        model,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: transcript }
-        ],
-        response_format: {
-          type: 'json_schema',
-          json_schema: { name: 'analysis_report', schema: ANALYSIS_SCHEMA, strict: true }
+        let parsed;
+        try {
+          const response = await openai.chat.completions.create({
+            model,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: transcript }
+            ],
+            response_format: {
+              type: 'json_schema',
+              json_schema: { name: 'analysis_report', schema: ANALYSIS_SCHEMA, strict: true }
+            }
+          });
+          parsed = JSON.parse(response.choices[0].message.content);
+        } catch (aiErr) {
+          console.error('Analysis LLM call failed:', aiErr);
+          return res.status(502).json({ error: 'Analysis failed — please try again.' });
         }
-      });
-      parsed = JSON.parse(response.choices[0].message.content);
-    } catch (aiErr) {
-      console.error('Analysis LLM call failed:', aiErr);
-      return res.status(502).json({ error: 'Analysis failed — please try again.' });
-    }
 
-    // Defensive validation — never trust model output blindly, even with
-    // a schema. Cap array/string sizes so one weird response can't bloat
-    // the DB. Field names here MUST match ANALYSIS_SCHEMA above.
-    const safeReport = {
-      session_id: sessionId,
-      user_id: req.user.id,
-      opening_line: typeof parsed.opening_line === 'string' ? parsed.opening_line.slice(0, 500) : '',
-      strengths: Array.isArray(parsed.strengths) ? parsed.strengths.slice(0, 15).map(s => String(s).slice(0, 300)) : [],
-      mistakes: Array.isArray(parsed.mistakes) ? parsed.mistakes.slice(0, 20).map(m => ({
-        title: String(m.title || '').slice(0, 200),
-        occurred_count: Number.isInteger(m.occurred_count) && m.occurred_count >= 0 ? m.occurred_count : 1,
-        context: String(m.context || '').slice(0, 1000),
-        reason: String(m.reason || '').slice(0, 500),
-        examples: Array.isArray(m.examples) ? m.examples.slice(0, 6).map(e => ({
-          hindi: String(e.hindi || '').slice(0, 400),
-          wrong_english: String(e.wrong_english || '').slice(0, 400),
-          correct_english: String(e.correct_english || '').slice(0, 400)
-        })) : []
-      })) : [],
-      growth_note: typeof parsed.growth_note === 'string' ? parsed.growth_note.slice(0, 1000) : '',
-      focus_next: typeof parsed.focus_next === 'string' ? parsed.focus_next.slice(0, 1000) : '',
-      confidence_score: Number.isInteger(parsed.confidence_score)
-        ? Math.min(10, Math.max(1, parsed.confidence_score))
-        : 5,
-      quiz: Array.isArray(parsed.quiz) ? parsed.quiz.slice(0, 10).map(q => ({
-        type: QUIZ_TYPES.has(q.type) ? q.type : 'yes_no',
-        prompt: String(q.prompt || '').slice(0, 300),
-        sentence: String(q.sentence || '').slice(0, 300),
-        hindi: String(q.hindi || '').slice(0, 300),
-        options: Array.isArray(q.options) ? q.options.slice(0, 3).map(o => String(o).slice(0, 200)) : [],
-        correct_option: String(q.correct_option || '').slice(0, 200),
-        is_correct: typeof q.is_correct === 'boolean' ? q.is_correct : false,
-        expected_answer: String(q.expected_answer || '').slice(0, 300)
-      })) : [],
-      model_version: model,
-      raw_response: parsed
-    };
+        // Defensive validation — never trust model output blindly, even with
+        // a schema. Cap array/string sizes so one weird response can't bloat
+        // the DB. Field names here MUST match ANALYSIS_SCHEMA above.
+        const safeReport = {
+          session_id: sessionId,
+          user_id: req.user.id,
+          opening_line: typeof parsed.opening_line === 'string' ? parsed.opening_line.slice(0, 500) : '',
+          strengths: Array.isArray(parsed.strengths) ? parsed.strengths.slice(0, 15).map(s => String(s).slice(0, 300)) : [],
+          mistakes: Array.isArray(parsed.mistakes) ? parsed.mistakes.slice(0, 20).map(m => ({
+            title: String(m.title || '').slice(0, 200),
+            occurred_count: Number.isInteger(m.occurred_count) && m.occurred_count >= 0 ? m.occurred_count : 1,
+            context: String(m.context || '').slice(0, 1000),
+            reason: String(m.reason || '').slice(0, 500),
+            examples: Array.isArray(m.examples) ? m.examples.slice(0, 6).map(e => ({
+              hindi: String(e.hindi || '').slice(0, 400),
+              wrong_english: String(e.wrong_english || '').slice(0, 400),
+              correct_english: String(e.correct_english || '').slice(0, 400)
+            })) : []
+          })) : [],
+          growth_note: typeof parsed.growth_note === 'string' ? parsed.growth_note.slice(0, 1000) : '',
+          focus_next: typeof parsed.focus_next === 'string' ? parsed.focus_next.slice(0, 1000) : '',
+          confidence_score: Number.isInteger(parsed.confidence_score)
+            ? Math.min(10, Math.max(1, parsed.confidence_score))
+            : 5,
+          quiz: Array.isArray(parsed.quiz) ? parsed.quiz.slice(0, 10).map(q => ({
+            type: QUIZ_TYPES.has(q.type) ? q.type : 'yes_no',
+            prompt: String(q.prompt || '').slice(0, 300),
+            sentence: String(q.sentence || '').slice(0, 300),
+            hindi: String(q.hindi || '').slice(0, 300),
+            options: Array.isArray(q.options) ? q.options.slice(0, 3).map(o => String(o).slice(0, 200)) : [],
+            correct_option: String(q.correct_option || '').slice(0, 200),
+            is_correct: typeof q.is_correct === 'boolean' ? q.is_correct : false,
+            expected_answer: String(q.expected_answer || '').slice(0, 300)
+          })) : [],
+          model_version: model,
+          raw_response: parsed
+        };
 
-    const { data: saved, error: saveErr } = await supabaseAdmin
-      .from('session_reports')
-      .insert(safeReport)
-      .select(REPORT_COLUMNS)
-      .single();
+        const { data: saved, error: saveErr } = await supabaseAdmin
+          .from('session_reports')
+          .insert(safeReport)
+          .select(REPORT_COLUMNS)
+          .single();
 
-    if (saveErr) return res.status(500).json({ error: saveErr.message });
-    res.json({ report: saved, already_existed: false });
+        if (saveErr) return next(saveErr);
+        res.json({ report: saved, already_existed: false });
+      } catch (err) { next(err); }
+    });
   } catch (err) { next(err); }
 });
 
