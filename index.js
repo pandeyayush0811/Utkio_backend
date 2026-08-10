@@ -48,6 +48,7 @@ const { notFoundHandler, errorHandler } = require('./middleware/errorHandler');
 const authRoutes = require('./routes/authRoutes');
 const userRoutes = require('./routes/userRoutes');
 const chatRoutes = require('./routes/chatRoutes');
+const paymentRoutes = require('./routes/paymentRoutes');
 
 const app = express();
 // Render (and most PaaS hosts) sit in front of this app as a reverse
@@ -92,7 +93,18 @@ app.use(cors({
     callback(err);
   }
 }));
-app.use(express.json({ limit: '5mb' })); // was: app.use(express.json());
+app.use(express.json({
+  limit: '5mb',
+  // Stashes the exact raw bytes of the request body onto req.rawBody,
+  // alongside the normal parsed req.body — needed by
+  // routes/paymentRoutes.js's webhook handler, which has to verify a
+  // signature computed over the exact bytes Razorpay sent, not a
+  // re-serialized copy of the parsed JSON (whitespace/key-order
+  // differences would make the signature check fail even for a
+  // legitimate request). Harmless for every other route — it's just an
+  // extra property nobody else reads.
+  verify: (req, res, buf) => { req.rawBody = buf; }
+}));
 app.use(morgan('combined'));
 app.use(generalLimiter);
 
@@ -103,6 +115,7 @@ app.use('/auth', authLimiter, authRoutes);
 // /chat/sessions) stay under the general limiter only.
 app.use('/users', (req, res, next) => (req.method === 'GET' ? next() : writeLimiter(req, res, next)), userRoutes);
 app.use('/chat', (req, res, next) => (req.method === 'GET' ? next() : writeLimiter(req, res, next)), chatRoutes);
+app.use('/payments', (req, res, next) => (req.method === 'GET' ? next() : writeLimiter(req, res, next)), paymentRoutes);
 
 app.use(notFoundHandler);
 if (process.env.SENTRY_DSN) Sentry.setupExpressErrorHandler(app); // reports to Sentry, then falls through
