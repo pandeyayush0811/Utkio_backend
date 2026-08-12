@@ -56,7 +56,7 @@ create index if not exists scenario_configs_active_idx on scenario_configs(activ
 -- title stays in English since it's shown as a UI label.
 insert into scenario_configs (key, category, title, character_brief, opening_situation, sort_order) values
   ('directions_stranger', 'directions', 'Asking a stranger for directions',
-   'Tum ek random raahgir (stranger) ho kisi shehar ki sadak par — sirf English aati hai, Hindi bilkul nahi samajh aati. Tumhe pata hai kuch nearby jagah (station/mall/hospital) tak ka raasta.',
+   'Tum ek random raahgir (stranger) ho kisi shehar ki sadak par — sirf English aati hai, koi bhi doosri bhasha (Hindi ho ya koi aur) bilkul nahi samajh aati. Tumhe pata hai kuch nearby jagah (station/mall/hospital) tak ka raasta.',
    'User se tum khud pehle baat shuru karoge — jaise koi genuinely apna raasta poochta hai ya user se raasta poochta hai. Scene: ek busy sadak/junction.',
    1),
   ('cab_driver', 'transport', 'Talking to a cab/auto driver',
