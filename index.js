@@ -48,6 +48,7 @@ const { notFoundHandler, errorHandler } = require('./middleware/errorHandler');
 const authRoutes = require('./routes/authRoutes');
 const userRoutes = require('./routes/userRoutes');
 const chatRoutes = require('./routes/chatRoutes');
+const scenarioRoutes = require('./routes/scenarioRoutes');
 const paymentRoutes = require('./routes/paymentRoutes');
 const adminRoutes = require('./routes/adminRoutes');
 
@@ -154,6 +155,19 @@ app.use('/auth', authLimiter, authRoutes);
 // writeLimiter only kicks in for POST/PATCH — GETs (like /users/me,
 // /chat/sessions) stay under the general limiter only.
 app.use('/users', (req, res, next) => (req.method === 'GET' ? next() : writeLimiter(req, res, next)), userRoutes);
+// Mounted at the MORE SPECIFIC path ('/chat/scenario') and BEFORE the
+// broader '/chat' mount below — Express matches middleware in
+// registration order, so without this ordering a request to
+// /chat/scenario/today would first enter chatRoutes (mounted at '/chat'),
+// which has no matching route for it and would only reach scenarioRoutes
+// by falling through. Mounting the specific path first avoids depending
+// on that fallthrough behavior at all.
+//
+// Kept as its own route file (not just another route in chatRoutes.js)
+// to keep the "daily scenario picking" concern out of the already large
+// session-sync/analysis file — GET-only today, so it never needs
+// writeLimiter, but the split holds even if that changes later.
+app.use('/chat/scenario', (req, res, next) => (req.method === 'GET' ? next() : writeLimiter(req, res, next)), scenarioRoutes);
 app.use('/chat', (req, res, next) => (req.method === 'GET' ? next() : writeLimiter(req, res, next)), chatRoutes);
 app.use('/payments', (req, res, next) => (req.method === 'GET' ? next() : writeLimiter(req, res, next)), paymentRoutes);
 // Uses the general limiter, not writeLimiter — this is an operator/cron

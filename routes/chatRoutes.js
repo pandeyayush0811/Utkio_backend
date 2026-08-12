@@ -3,7 +3,10 @@ const router = express.Router();
 const { requireAuth } = require('../middleware/authMiddleware');
 const { requirePlan } = require('../middleware/requirePlan');
 const { supabaseAdmin } = require('../lib/supabaseClient');
+const { startOfUtcDay } = require('../lib/scenarioSelector');
 const OpenAI = require('openai');
+
+const SESSION_TYPES = new Set(['freeform', 'scenario']);
 
 const MIN_TURNS_FOR_ANALYSIS = 10; // matches the frontend's button-enable threshold
 
@@ -13,6 +16,20 @@ const MAX_MESSAGES_PER_SESSION = 500; // sanity cap — a normal session is a fe
 // gpt-4.1, or you want to A/B a different model) without a code change +
 // redeploy — just update ANALYSIS_MODEL in the environment and restart.
 const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL || 'gpt-4.1';
+
+// Pure validator for the two new optional POST /sessions fields — kept
+// standalone (like validateMessages below) so it's unit-testable without
+// spinning up Express or Supabase.
+function validateSessionType(sessionType, scenarioKey) {
+  const resolved = sessionType === undefined ? 'freeform' : sessionType;
+  if (!SESSION_TYPES.has(resolved)) {
+    return { error: `session_type must be one of: ${[...SESSION_TYPES].join(', ')}` };
+  }
+  if (resolved === 'scenario' && (!scenarioKey || typeof scenarioKey !== 'string')) {
+    return { error: 'scenario_key is required when session_type is "scenario"' };
+  }
+  return { error: null, resolvedSessionType: resolved };
+}
 
 function validateMessages(messages) {
   if (!Array.isArray(messages) || messages.length === 0) return 'messages must be a non-empty array';
@@ -34,7 +51,7 @@ router.get('/sessions', requireAuth, async (req, res, next) => {
 
     const { data, error } = await supabaseAdmin
       .from('chat_sessions')
-      .select('id, started_at, ended_at, turn_count, created_at')
+      .select('id, started_at, ended_at, turn_count, created_at, session_type, scenario_key')
       .eq('user_id', req.user.id)
       .order('started_at', { ascending: false });
 
@@ -105,12 +122,21 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
   try {
     if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
 
-    const { session_id, started_at, ended_at, messages } = req.body;
+    // session_type/scenario_key are new, optional fields (see
+    // sql/migrations/006_scenario_simulation.sql) — a freeform chat.html
+    // save omits both entirely, which is why they default here rather
+    // than being required. Kept validated the same way everything else in
+    // this handler is: reject before requirePlan runs, so a malformed
+    // request never burns a trial credit.
+    const { session_id, started_at, ended_at, messages, session_type, scenario_key } = req.body;
 
     if (!started_at || isNaN(Date.parse(started_at))) return res.status(400).json({ error: 'started_at must be a valid ISO timestamp' });
     if (!ended_at || isNaN(Date.parse(ended_at))) return res.status(400).json({ error: 'ended_at must be a valid ISO timestamp' });
     const msgError = validateMessages(messages);
     if (msgError) return res.status(400).json({ error: msgError });
+    const sessionTypeCheck = validateSessionType(session_type, scenario_key);
+    if (sessionTypeCheck.error) return res.status(400).json({ error: sessionTypeCheck.error });
+    const resolvedSessionType = sessionTypeCheck.resolvedSessionType;
 
     // Body is valid — only NOW check plan/trial access. Doing this before
     // validation would burn a trial credit on a malformed request that was
@@ -118,6 +144,33 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
     // draining a user's free trial for nothing.
     requirePlan('chat')(req, res, async () => {
       try {
+        // Server-side enforcement of "one scenario per day" — the real
+        // boundary (GET /chat/scenario/today's already_completed_today is
+        // a courtesy for the UI, same relationship as
+        // requireActivePlan()/requirePlan() elsewhere in this app). Only
+        // applies to brand-new scenario sessions: resuming an
+        // already-started one (session_id set) is a continuation of the
+        // SAME day's attempt, not a new one, so it's exempt.
+        if (!session_id && resolvedSessionType === 'scenario') {
+          const todayStart = startOfUtcDay(new Date()).toISOString();
+          const { data: todaysScenarioSession, error: todayCheckErr } = await supabaseAdmin
+            .from('chat_sessions')
+            .select('id')
+            .eq('user_id', req.user.id)
+            .eq('session_type', 'scenario')
+            .gte('started_at', todayStart)
+            .limit(1)
+            .maybeSingle();
+          if (todayCheckErr) return next(todayCheckErr);
+          if (todaysScenarioSession) {
+            return res.status(409).json({
+              error: 'scenario_already_done_today',
+              message: 'Aaj ka scenario already complete ho chuka hai — kal ek naya milega.',
+              session_id: todaysScenarioSession.id
+            });
+          }
+        }
+
         // ---- Resume mode: append to an existing session ----
         if (session_id) {
           const { data: existing, error: existErr } = await supabaseAdmin
@@ -171,7 +224,14 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
         // ---- Normal mode: brand new session ----
         const { data: session, error: sessionErr } = await supabaseAdmin
           .from('chat_sessions')
-          .insert({ user_id: req.user.id, started_at, ended_at, turn_count: messages.length })
+          .insert({
+            user_id: req.user.id,
+            started_at,
+            ended_at,
+            turn_count: messages.length,
+            session_type: resolvedSessionType,
+            scenario_key: resolvedSessionType === 'scenario' ? scenario_key : null
+          })
           .select()
           .single();
 
@@ -479,3 +539,4 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
 
 module.exports = router;
 module.exports.validateMessages = validateMessages; // exported for tests only
+module.exports.validateSessionType = validateSessionType; // exported for tests only
