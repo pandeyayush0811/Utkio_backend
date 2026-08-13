@@ -17,6 +17,16 @@ const MAX_MESSAGES_PER_SESSION = 500; // sanity cap — a normal session is a fe
 // redeploy — just update ANALYSIS_MODEL in the environment and restart.
 const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL || 'gpt-4.1';
 
+// A claimed-but-unfinished report row (see the atomic-claim comment on
+// POST /sessions/:id/analyze below) should normally resolve in 10-20s.
+// If the server crashes/restarts in that exact window, the `res.once
+// ('finish')` cleanup never runs and the claim row is orphaned forever —
+// which, thanks to the unique constraint, would permanently block that
+// session from ever getting a report. Anything older than this is
+// treated as abandoned and safe to reclaim, rather than trusting a
+// single crash-prone in-process cleanup as the only safety net.
+const STALE_CLAIM_MS = 3 * 60 * 1000; // 3 minutes — generous vs. the ~20s normal case
+
 // Pure validator for the two new optional POST /sessions fields — kept
 // standalone (like validateMessages below) so it's unit-testable without
 // spinning up Express or Supabase.
@@ -404,6 +414,27 @@ router.get('/sessions/:id/report', requireAuth, async (req, res, next) => {
 // Generates (or returns the already-generated) report for one session.
 // Synchronous — a single transcript is small enough that this finishes
 // in a few seconds, so no job queue/polling is needed for this feature.
+//
+// CONCURRENCY / DOUBLE-CHARGE FIX:
+// The OpenAI call below takes 10-20 seconds. During that window the
+// report doesn't exist in the DB yet, so a second request for the SAME
+// session (double-tap, or the user backing out of report.html and
+// re-triggering "Generate" from chat.html/history.html before the first
+// call finished) used to sail straight past the "does a report already
+// exist?" fast-path below, then ALSO consume a trial/plan credit via
+// requirePlan(), even though only one of the two ever ends up saved
+// (session_reports.session_id is unique, so only the first INSERT can
+// land) — net effect: 1 report, but 2-3 credits gone.
+//
+// Fixed by claiming the row atomically BEFORE requirePlan runs, using
+// the exact same unique constraint that used to only protect the final
+// INSERT: insert a bare placeholder row (session_id + user_id only,
+// every report field left NULL) right away. Only one concurrent request
+// can win that INSERT — Postgres guarantees it via the unique constraint
+// on session_id. The loser gets a 23505 (unique_violation) and bails
+// out immediately with a 409, having never called requirePlan or
+// OpenAI. The winner later UPDATEs its own claimed row with the real
+// report once OpenAI responds.
 router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
   try {
     if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
@@ -411,19 +442,41 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
 
     const sessionId = req.params.id;
 
-    // Idempotent fast-path: if a report already exists, just return it —
-    // checked BEFORE spending a trial/plan credit below (see requirePlan
-    // call further down), so re-clicking "generate report" on an
-    // already-reported session is free, not a second charge against the
-    // user's trial. Also enforced by the DB's unique constraint on
-    // session_id — this is just the friendly, credit-safe fast-path.
+    // Fast-path: does a row already exist for this session?
+    // A row here means one of two things — tell them apart by
+    // confidence_score, which is NULL only on a still-in-progress claim
+    // row and is ALWAYS a real integer (1-10) on a completed report (see
+    // safeReport below, which never leaves it null):
+    //   - confidence_score set  -> a finished report. Return it as-is,
+    //     no credit charged (this is the original idempotent fast-path).
+    //   - confidence_score NULL -> someone else's request already
+    //     claimed this session and is still waiting on OpenAI. Tell the
+    //     caller to wait instead of starting a second, credit-burning
+    //     attempt at the same report.
     const { data: existing } = await supabaseAdmin
       .from('session_reports')
       .select(REPORT_COLUMNS)
       .eq('session_id', sessionId)
       .eq('user_id', req.user.id)
       .single();
-    if (existing) return res.json({ report: existing, already_existed: true });
+    if (existing) {
+      if (existing.confidence_score !== null && existing.confidence_score !== undefined) {
+        return res.json({ report: existing, already_existed: true });
+      }
+      // Still-in-progress claim — unless it's old enough to be almost
+      // certainly abandoned (server crashed mid-generation, see
+      // STALE_CLAIM_MS above), in which case delete it and fall through
+      // to claim it fresh instead of blocking this session forever.
+      const claimAgeMs = Date.now() - new Date(existing.generated_at).getTime();
+      if (claimAgeMs < STALE_CLAIM_MS) {
+        return res.status(409).json({
+          error: 'report_in_progress',
+          message: 'Report already generate ho raha hai — thoda ruko.'
+        });
+      }
+      console.warn(`[analyze] Reclaiming stale report claim for session ${sessionId} (${Math.round(claimAgeMs / 1000)}s old) — previous attempt likely crashed.`);
+      await supabaseAdmin.from('session_reports').delete().eq('id', existing.id);
+    }
 
     // Ownership + min-turns check ALSO happen before requirePlan below —
     // a request that was never going to succeed (wrong session, or too
@@ -440,8 +493,43 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
       return res.status(400).json({ error: `Session needs at least ${MIN_TURNS_FOR_ANALYSIS} turns to analyze (has ${session.turn_count}).` });
     }
 
-    // All pre-checks passed — only NOW check plan/trial access, right
-    // before the actual (paid) OpenAI call.
+    // ---- Atomic claim (see comment above the route for the full why) ----
+    const { data: claim, error: claimErr } = await supabaseAdmin
+      .from('session_reports')
+      .insert({ session_id: sessionId, user_id: req.user.id })
+      .select('id')
+      .single();
+
+    if (claimErr) {
+      if (claimErr.code === '23505') { // unique_violation — someone else won the race
+        return res.status(409).json({
+          error: 'report_in_progress',
+          message: 'Report already generate ho raha hai — thoda ruko.'
+        });
+      }
+      return next(claimErr);
+    }
+
+    // Safety net: if ANYTHING below fails (requirePlan denies, OpenAI
+    // errors, the final UPDATE fails) the claim row must not sit around
+    // forever half-finished — that would permanently block this session
+    // from ever getting a report (the unique constraint would reject
+    // every future attempt). `reportSaved` flags the one success path
+    // that should survive; every other way this response can finish
+    // (including requirePlan's own res.status(402) denial, which never
+    // calls next()) triggers cleanup here instead of needing a manual
+    // delete() in every single failure branch below.
+    let reportSaved = false;
+    res.once('finish', () => {
+      if (!reportSaved && res.statusCode >= 400) {
+        supabaseAdmin.from('session_reports').delete().eq('id', claim.id)
+          .then(() => {})
+          .catch((e) => console.error('Failed to release report claim row after failure:', e));
+      }
+    });
+
+    // All pre-checks (and the claim) passed — only NOW check plan/trial
+    // access, right before the actual (paid) OpenAI call.
     requirePlan('report')(req, res, async () => {
       try {
         // Fetch user's profile — report ko sirf transcript se nahi, balki YE
@@ -490,8 +578,6 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
         // a schema. Cap array/string sizes so one weird response can't bloat
         // the DB. Field names here MUST match ANALYSIS_SCHEMA above.
         const safeReport = {
-          session_id: sessionId,
-          user_id: req.user.id,
           opening_line: typeof parsed.opening_line === 'string' ? parsed.opening_line.slice(0, 500) : '',
           strengths: Array.isArray(parsed.strengths) ? parsed.strengths.slice(0, 15).map(s => String(s).slice(0, 300)) : [],
           mistakes: Array.isArray(parsed.mistakes) ? parsed.mistakes.slice(0, 20).map(m => ({
@@ -524,13 +610,17 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
           raw_response: parsed
         };
 
+        // UPDATE the claimed row (not insert) — the row already exists
+        // (created by the claim step above), we're just filling it in.
         const { data: saved, error: saveErr } = await supabaseAdmin
           .from('session_reports')
-          .insert(safeReport)
+          .update(safeReport)
+          .eq('id', claim.id)
           .select(REPORT_COLUMNS)
           .single();
 
         if (saveErr) return next(saveErr);
+        reportSaved = true;
         res.json({ report: saved, already_existed: false });
       } catch (err) { next(err); }
     });
