@@ -224,3 +224,49 @@ if (RECONCILE_INTERVAL_MINUTES > 0) {
   // long gap before the first check.
   setTimeout(runReconciliation, 60 * 1000);
 }
+
+// ═══════════════════════════════════════════════════════════════
+// OPTIONAL in-process Commit Mode midnight sweep.
+//
+// Off by default (COMMIT_MODE_SWEEP_ENABLED unset) — same opt-in
+// pattern as the reconciliation scheduler above. If enabled, self-
+// schedules its FIRST run for the next IST midnight (+ a small safety
+// delay so it runs just after, not exactly at, the boundary — avoids a
+// race against sessions still being saved in the final seconds of the
+// day), then re-arms itself every 24h after that.
+//
+// Single-instance-deploy assumption, same caveat as the reconciliation
+// scheduler: on a multi-instance deploy, prefer an external cron hitting
+// POST /admin/commit-mode-sweep once instead of enabling this on every
+// instance. Unlike reconciliation, running this sweep TWICE in the same
+// day is still safe (judged_at guard in lib/commitModeEnforcer.js makes
+// it a no-op the second time) but there's no reason to do the redundant
+// work.
+// ═══════════════════════════════════════════════════════════════
+if (process.env.COMMIT_MODE_SWEEP_ENABLED === 'true') {
+  const { runCommitModeMidnightSweep } = require('./lib/commitModeEnforcer');
+  const { msUntilNextIstMidnight } = require('./lib/commitMode');
+  const SWEEP_SAFETY_DELAY_MS = 5 * 60 * 1000; // run at 00:05 IST, not 00:00 IST sharp
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  console.log('Commit Mode midnight sweep scheduler enabled.');
+
+  const runSweep = async () => {
+    try {
+      const summary = await runCommitModeMidnightSweep();
+      console.log('[commitModeEnforcer] sweep run:', summary);
+    } catch (err) {
+      console.error('[commitModeEnforcer] sweep run failed:', err);
+    }
+  };
+
+  const armNextSweep = () => {
+    const delay = msUntilNextIstMidnight() + SWEEP_SAFETY_DELAY_MS;
+    setTimeout(async () => {
+      await runSweep();
+      setInterval(runSweep, DAY_MS); // now that we're aligned to ~00:05 IST, plain 24h ticks stay aligned
+    }, delay);
+  };
+
+  armNextSweep();
+}

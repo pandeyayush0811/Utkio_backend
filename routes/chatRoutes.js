@@ -4,6 +4,7 @@ const { requireAuth } = require('../middleware/authMiddleware');
 const { requirePlan } = require('../middleware/requirePlan');
 const { supabaseAdmin } = require('../lib/supabaseClient');
 const { startOfUtcDay } = require('../lib/scenarioSelector');
+const { recordCommitModeProgress, getTodaysCommitModeProgress } = require('../lib/commitMode');
 const OpenAI = require('openai');
 
 const SESSION_TYPES = new Set(['freeform', 'scenario']);
@@ -122,6 +123,20 @@ router.get('/sessions/:id', requireAuth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// GET /chat/commit-mode/today — today's (IST) Commit Mode progress, for
+// the persistent progress widget (see shared/commit-mode-widget.js).
+// Deliberately NOT gated behind requirePlan — a user whose Commit Mode
+// just got terminated overnight still needs to be able to load this once
+// to see why/confirm, and a non-Commit-Mode user hitting this by mistake
+// just gets harmless all-false zeros back, not an error.
+router.get('/commit-mode/today', requireAuth, async (req, res, next) => {
+  try {
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+    const progress = await getTodaysCommitModeProgress(req.user.id);
+    res.json(progress);
+  } catch (err) { next(err); }
+});
+
 // Called once a voice session ends (or on app-open recovery for a
 // session that never made it to the backend last time). Two modes:
 //   - No session_id  -> creates a brand new session (turn_index starts at 0)
@@ -185,7 +200,7 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
         if (session_id) {
           const { data: existing, error: existErr } = await supabaseAdmin
             .from('chat_sessions')
-            .select('id, turn_count')
+            .select('id, turn_count, ended_at')
             .eq('id', session_id)
             .eq('user_id', req.user.id) // ownership check
             .single();
@@ -228,6 +243,22 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
 
           if (updateErr) return next(updateErr);
 
+          // Commit Mode progress: only meaningful for freeform ('chat')
+          // sessions — a resumed scenario session isn't a thing today
+          // (scenario.html has no resume flow, see CODEBASE_MAP.md), but
+          // the session_type check here is cheap insurance either way.
+          // Incremental elapsed time = new ended_at minus the PREVIOUS
+          // ended_at (not started_at), so re-syncing an already-counted
+          // stretch of a resumed conversation never double-counts it
+          // toward today's 5-minute requirement — this is a fire-and-
+          // forget best-effort call (see recordCommitModeProgress's own
+          // doc comment for why it never blocks or fails this response).
+          if (resolvedSessionType === 'freeform') {
+            const previousEndedAt = existing.ended_at ? new Date(existing.ended_at) : new Date(started_at);
+            const deltaSeconds = (new Date(ended_at) - previousEndedAt) / 1000;
+            recordCommitModeProgress({ userId: req.user.id, kind: 'chat', seconds: deltaSeconds, at: new Date(ended_at) });
+          }
+
           return res.json({ session_id, turn_count: newTurnCount });
         }
 
@@ -254,6 +285,15 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
           await supabaseAdmin.from('chat_sessions').delete().eq('id', session.id); // don't leave an orphaned empty session
           return next(messagesErr);
         }
+
+        // Commit Mode progress — fire-and-forget, see the resume-mode
+        // call site above for the full rationale. For a brand new
+        // session, elapsed = ended_at - started_at as reported by the
+        // client (same duration signal the app already trusts for
+        // started_at/ended_at generally — no new trust boundary here).
+        const kind = resolvedSessionType === 'scenario' ? 'scenario' : 'chat';
+        const elapsedSeconds = kind === 'chat' ? (new Date(ended_at) - new Date(started_at)) / 1000 : 0;
+        recordCommitModeProgress({ userId: req.user.id, kind, seconds: elapsedSeconds, at: new Date(ended_at) });
 
         res.json({ session_id: session.id, turn_count: rows.length });
       } catch (err) { next(err); }

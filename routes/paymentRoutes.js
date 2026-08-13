@@ -12,6 +12,33 @@ const { verifyHmacSignature } = require('../lib/verifySignature');
 // "what does a captured payment turn into", not two copies that can
 // silently drift apart.
 const { PLAN_PRICES_PAISE, activatePlan } = require('../lib/planActivation');
+const {
+  COMMIT_MODE_PLAN,
+  COMMIT_MODE_DISCLOSURE_VERSION,
+  getUnconsumedConsent,
+  recordConsent,
+  consumeConsent
+} = require('../lib/commitMode');
+
+// Shared by /create-order and /checkout/init below — a commit_mode
+// purchase attempt is blocked (402, not 400: this is an access/consent
+// problem, not a malformed request) unless a fresh, unconsumed consent
+// row is on file. Returns the consent row (so the caller can consume it
+// after the payment row is inserted) or sends the 402 itself and returns
+// null, so callers just do: `const consent = await ...; if (!consent) return;`
+async function requireCommitModeConsentOrRespond(req, res, plan) {
+  if (plan !== COMMIT_MODE_PLAN) return { skip: true };
+  const consent = await getUnconsumedConsent(req.user.id);
+  if (!consent) {
+    res.status(402).json({
+      error: 'commit_mode_consent_required',
+      message: 'Commit Mode lene se pehle rules wala disclosure dekhna aur agree karna zaroori hai.',
+      disclosure_version: COMMIT_MODE_DISCLOSURE_VERSION
+    });
+    return { skip: false, consent: null };
+  }
+  return { skip: false, consent };
+}
 
 // ═══════════════════════════════════════════════════════════════
 // POST /payments/create-order
@@ -28,6 +55,9 @@ router.post('/create-order', requireAuth, async (req, res, next) => {
     }
 
     const amount = PLAN_PRICES_PAISE[plan];
+
+    const consentCheck = await requireCommitModeConsentOrRespond(req, res, plan);
+    if (!consentCheck.skip && !consentCheck.consent) return; // 402 already sent
 
     // receipt is Razorpay's own free-text reference field (max 40
     // chars) — not shown to the user, just useful for cross-referencing
@@ -70,15 +100,25 @@ router.post('/create-order', requireAuth, async (req, res, next) => {
       notes: { user_id: req.user.id, plan }
     });
 
-    const { error: insertError } = await supabaseAdmin.from('payments').insert({
-      user_id: req.user.id,
-      plan,
-      amount_paise: amount,
-      currency: 'INR',
-      razorpay_order_id: order.id,
-      status: 'created'
-    });
+    const { data: paymentRow, error: insertError } = await supabaseAdmin
+      .from('payments')
+      .insert({
+        user_id: req.user.id,
+        plan,
+        amount_paise: amount,
+        currency: 'INR',
+        razorpay_order_id: order.id,
+        status: 'created'
+      })
+      .select('id')
+      .single();
     if (insertError) return next(insertError);
+
+    // Tie this purchase to the consent that unlocked it, so it can never
+    // be reused to back a second purchase without re-showing the rules.
+    if (!consentCheck.skip && consentCheck.consent) {
+      await consumeConsent(consentCheck.consent.id, paymentRow.id);
+    }
 
     res.json({
       order_id: order.id,
@@ -86,6 +126,22 @@ router.post('/create-order', requireAuth, async (req, res, next) => {
       currency: 'INR',
       key_id: process.env.RAZORPAY_KEY_ID // publishable — safe to send to client, needed by the checkout widget
     });
+  } catch (err) { next(err); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// POST /payments/commit-mode/consent
+// Called the moment the user taps "I understand and agree" on the
+// pre-purchase disclosure card — BEFORE create-order/checkout/init, which
+// both now reject plan=commit_mode without an unconsumed row from here.
+// This is the legal record: server-timestamped, independent of the
+// client. See lib/commitMode.js recordConsent() + migration 007.
+// ═══════════════════════════════════════════════════════════════
+router.post('/commit-mode/consent', requireAuth, async (req, res, next) => {
+  try {
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+    const consent = await recordConsent(req.user.id);
+    res.json({ consented_at: consent.consented_at, disclosure_version: COMMIT_MODE_DISCLOSURE_VERSION });
   } catch (err) { next(err); }
 });
 
@@ -259,6 +315,10 @@ router.post('/checkout/init', requireAuth, async (req, res, next) => {
     }
 
     const amount = PLAN_PRICES_PAISE[plan];
+
+    const consentCheck = await requireCommitModeConsentOrRespond(req, res, plan);
+    if (!consentCheck.skip && !consentCheck.consent) return; // 402 already sent
+
     const receipt = `${plan}_${req.user.id}_${Date.now()}`.slice(0, 40);
 
     // Same dedup guard as /create-order above — see comment there for why
@@ -327,6 +387,10 @@ router.post('/checkout/init', requireAuth, async (req, res, next) => {
       .select('id')
       .single();
     if (insertError) return next(insertError);
+
+    if (!consentCheck.skip && consentCheck.consent) {
+      await consumeConsent(consentCheck.consent.id, paymentRow.id);
+    }
 
     const token = crypto.randomBytes(32).toString('hex');
     const expiresAt = new Date(Date.now() + CHECKOUT_TOKEN_TTL_MS).toISOString();
@@ -437,7 +501,7 @@ router.get('/status', requireAuth, async (req, res, next) => {
 
     const { data, error } = await supabaseAdmin
       .from('profiles')
-      .select('plan, plan_expires_at')
+      .select('plan, plan_expires_at, commit_mode_terminated_at, commit_mode_termination_reason')
       .eq('id', req.user.id)
       .single();
     if (error) return next(error);
@@ -465,6 +529,12 @@ router.get('/status', requireAuth, async (req, res, next) => {
       plan: data.plan,
       plan_expires_at: data.plan_expires_at,
       active,
+      // Only meaningful right after a termination — the frontend shows a
+      // one-time explanation banner (see settings.html) then this stays
+      // in the response forever after (harmless; a stale historical
+      // fact, not something that needs to be "dismissed" server-side).
+      commit_mode_terminated_at: data.commit_mode_terminated_at,
+      commit_mode_termination_reason: data.commit_mode_termination_reason,
       trial: hasPaidPlan ? null : {
         active: Boolean(trial && trial.trial_active),
         days_left: trial ? Math.max(0, Math.floor(Number(trial.trial_days_left) * 10) / 10) : 0,

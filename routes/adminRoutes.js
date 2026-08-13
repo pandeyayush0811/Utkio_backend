@@ -2,6 +2,7 @@ const express = require('express');
 const crypto = require('crypto');
 const router = express.Router();
 const { reconcilePendingPayments } = require('../lib/reconcilePayments');
+const { runCommitModeMidnightSweep } = require('../lib/commitModeEnforcer');
 
 // Not a per-user action, so requireAuth (Supabase user token) doesn't
 // fit here — this needs its own operator-only secret instead. Uses the
@@ -45,6 +46,24 @@ function requireAdminSecret(req, res, next) {
 router.post('/reconcile-payments', requireAdminSecret, async (req, res, next) => {
   try {
     const summary = await reconcilePendingPayments();
+    res.json(summary);
+  } catch (err) { next(err); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// POST /admin/commit-mode-sweep
+//
+// Judges yesterday's (IST) Commit Mode progress for every user currently
+// on plan='commit_mode' and terminates anyone who missed the daily
+// requirement. See lib/commitModeEnforcer.js for the full logic and
+// idempotency guarantees. Call this from a scheduled job shortly after
+// each IST midnight (00:05 IST is safe — see index.js's optional
+// in-process scheduler for the same wiring reconcile-payments uses), or
+// manually if a support ticket needs a re-check.
+// ═══════════════════════════════════════════════════════════════
+router.post('/commit-mode-sweep', requireAdminSecret, async (req, res, next) => {
+  try {
+    const summary = await runCommitModeMidnightSweep();
     res.json(summary);
   } catch (err) { next(err); }
 });
