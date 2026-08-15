@@ -315,86 +315,19 @@ router.delete('/sessions', requireAuth, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// Response schema the model must conform to — structured output means no
-// parsing guesswork and no risk of the model wandering into free-form
-// prose that's hard to render or reason about safely.
-// (Plain JSON Schema, used with OpenAI's response_format: json_schema.)
-// NOTE: this must stay in lockstep with the `chat_analysis` prompt in
-// prompt_configs — if you change the prompt's expected fields, update
-// this schema (and the safeReport sanitizer + SQL columns below) too.
-const ANALYSIS_SCHEMA = {
-  type: 'object',
-  properties: {
-    opening_line: { type: 'string' },
-    strengths: { type: 'array', items: { type: 'string' } },
-    mistakes: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          title: { type: 'string' },
-          occurred_count: { type: 'integer' },
-          context: { type: 'string' },
-          reason: { type: 'string' },
-          examples: {
-            type: 'array',
-            items: {
-              type: 'object',
-              properties: {
-                hindi: { type: 'string' },
-                wrong_english: { type: 'string' },
-                correct_english: { type: 'string' }
-              },
-              required: ['hindi', 'wrong_english', 'correct_english'],
-              additionalProperties: false
-            }
-          }
-        },
-        required: ['title', 'occurred_count', 'context', 'reason', 'examples'],
-        additionalProperties: false
-      }
-    },
-    growth_note: { type: 'string' },
-    focus_next: { type: 'string' },
-    // 1-10 — a single glanceable number for the top of the report /
-    // share card. Keeps the report from being 100% text.
-    confidence_score: { type: 'integer' },
-    // Turn-immediately-after-session quiz, generated in the SAME call so
-    // it's grounded in this session's actual mistakes — no extra LLM
-    // round trip. Every question object carries all possible fields;
-    // irrelevant ones are "" / [] / false for that question's type (kept
-    // flat on purpose — strict structured-output schemas don't handle
-    // polymorphic/union shapes well).
-    quiz: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          // yes_no: judge if `sentence` is correct (swipe right/left).
-          // choose_3: pick the correct one of 3 `options`.
-          // hindi_to_english: `hindi` shown, pick correct of 3 `options`.
-          // speak: user must SPEAK `expected_answer` out loud.
-          type: { type: 'string', enum: ['yes_no', 'choose_3', 'hindi_to_english', 'speak'] },
-          prompt: { type: 'string' }, // the instruction line shown above the card
-          sentence: { type: 'string' }, // yes_no: the English sentence to judge
-          hindi: { type: 'string' }, // hindi_to_english / speak: the Hindi thought
-          options: { type: 'array', items: { type: 'string' } }, // choose_3 / hindi_to_english: exactly 3
-          correct_option: { type: 'string' }, // choose_3 / hindi_to_english: must exactly match one option
-          is_correct: { type: 'boolean' }, // yes_no: whether `sentence` is actually correct
-          expected_answer: { type: 'string' } // speak: the correct English the user should say
-        },
-        required: ['type', 'prompt', 'sentence', 'hindi', 'options', 'correct_option', 'is_correct', 'expected_answer'],
-        additionalProperties: false
-      }
-    }
-  },
-  required: ['opening_line', 'strengths', 'mistakes', 'growth_note', 'focus_next', 'confidence_score', 'quiz'],
-  additionalProperties: false
-};
+// The report moved from a structured-JSON shape (separate opening_line/
+// strengths/mistakes[]/growth_note/focus_next/confidence_score/quiz[]
+// fields, each rendered as its own card) to a single natural-language
+// Hinglish write-up — see sql/migrations/008_natural_report_format.sql.
+// So there's no JSON schema to force anymore: the OpenAI call below is
+// plain free-text completion, and the whole response is stored as-is in
+// session_reports.report_text. report.html renders it directly (bold
+// via **markers**, paragraphs via blank lines) instead of building cards
+// from separate fields. No quiz is generated anymore either.
 
 // Only used if prompt_configs is unreachable/misconfigured — the real
 // prompt always comes from the DB (see getAnalysisPrompt below).
-const DEFAULT_ANALYSIS_PROMPT = 'You are a warm, encouraging English mentor. Analyze the USER\'s English only (ignore the assistant\'s lines) and return structured JSON matching the given schema.';
+const DEFAULT_ANALYSIS_PROMPT = 'You are a warm, encouraging English coach. Read the USER\'s turns only (ignore the assistant\'s lines) and write a natural, human-sounding feedback report in Hinglish — plain text, not JSON, not bullet-labeled fields.';
 
 // Folds the user's profile (name/age/occupation/city/goal/level) into the
 // analysis prompt, so the report is anchored to WHO this person is, not
@@ -428,9 +361,7 @@ async function getAnalysisPrompt() {
 
 // Columns for the new report shape — kept in one place so the idempotent
 // fast-path and the GET route can't drift apart.
-const REPORT_COLUMNS = 'id, session_id, opening_line, strengths, mistakes, growth_note, focus_next, confidence_score, quiz, generated_at';
-
-const QUIZ_TYPES = new Set(['yes_no', 'choose_3', 'hindi_to_english', 'speak']);
+const REPORT_COLUMNS = 'id, session_id, report_text, model_version, generated_at';
 
 // Returns the existing report for a session, if one has been generated.
 // 404 (not 200 with null) if none exists — the frontend uses this to
@@ -484,15 +415,15 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
 
     // Fast-path: does a row already exist for this session?
     // A row here means one of two things — tell them apart by
-    // confidence_score, which is NULL only on a still-in-progress claim
-    // row and is ALWAYS a real integer (1-10) on a completed report (see
+    // report_text, which is NULL only on a still-in-progress claim row
+    // and is ALWAYS a non-empty string on a completed report (see
     // safeReport below, which never leaves it null):
-    //   - confidence_score set  -> a finished report. Return it as-is,
-    //     no credit charged (this is the original idempotent fast-path).
-    //   - confidence_score NULL -> someone else's request already
-    //     claimed this session and is still waiting on OpenAI. Tell the
-    //     caller to wait instead of starting a second, credit-burning
-    //     attempt at the same report.
+    //   - report_text set  -> a finished report. Return it as-is, no
+    //     credit charged (this is the original idempotent fast-path).
+    //   - report_text NULL -> someone else's request already claimed
+    //     this session and is still waiting on OpenAI. Tell the caller
+    //     to wait instead of starting a second, credit-burning attempt
+    //     at the same report.
     const { data: existing } = await supabaseAdmin
       .from('session_reports')
       .select(REPORT_COLUMNS)
@@ -500,7 +431,7 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
       .eq('user_id', req.user.id)
       .single();
     if (existing) {
-      if (existing.confidence_score !== null && existing.confidence_score !== undefined) {
+      if (existing.report_text) {
         return res.json({ report: existing, already_existed: true });
       }
       // Still-in-progress claim — unless it's old enough to be almost
@@ -595,60 +526,36 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
         const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
         const model = ANALYSIS_MODEL;
 
-        let parsed;
+        let rawText;
         try {
           const response = await openai.chat.completions.create({
             model,
             messages: [
               { role: 'system', content: systemPrompt },
               { role: 'user', content: transcript }
-            ],
-            response_format: {
-              type: 'json_schema',
-              json_schema: { name: 'analysis_report', schema: ANALYSIS_SCHEMA, strict: true }
-            }
+            ]
+            // No response_format here on purpose — the new prompt asks
+            // for a natural free-text write-up, not JSON. Forcing a JSON
+            // schema would fight that instruction.
           });
-          parsed = JSON.parse(response.choices[0].message.content);
+          rawText = response.choices[0].message.content;
         } catch (aiErr) {
           console.error('Analysis LLM call failed:', aiErr);
           return res.status(502).json({ error: 'Analysis failed — please try again.' });
         }
 
-        // Defensive validation — never trust model output blindly, even with
-        // a schema. Cap array/string sizes so one weird response can't bloat
-        // the DB. Field names here MUST match ANALYSIS_SCHEMA above.
+        // Defensive validation — never trust model output blindly. Cap
+        // length so one weird/runaway response can't bloat the DB.
         const safeReport = {
-          opening_line: typeof parsed.opening_line === 'string' ? parsed.opening_line.slice(0, 500) : '',
-          strengths: Array.isArray(parsed.strengths) ? parsed.strengths.slice(0, 15).map(s => String(s).slice(0, 300)) : [],
-          mistakes: Array.isArray(parsed.mistakes) ? parsed.mistakes.slice(0, 20).map(m => ({
-            title: String(m.title || '').slice(0, 200),
-            occurred_count: Number.isInteger(m.occurred_count) && m.occurred_count >= 0 ? m.occurred_count : 1,
-            context: String(m.context || '').slice(0, 1000),
-            reason: String(m.reason || '').slice(0, 500),
-            examples: Array.isArray(m.examples) ? m.examples.slice(0, 6).map(e => ({
-              hindi: String(e.hindi || '').slice(0, 400),
-              wrong_english: String(e.wrong_english || '').slice(0, 400),
-              correct_english: String(e.correct_english || '').slice(0, 400)
-            })) : []
-          })) : [],
-          growth_note: typeof parsed.growth_note === 'string' ? parsed.growth_note.slice(0, 1000) : '',
-          focus_next: typeof parsed.focus_next === 'string' ? parsed.focus_next.slice(0, 1000) : '',
-          confidence_score: Number.isInteger(parsed.confidence_score)
-            ? Math.min(10, Math.max(1, parsed.confidence_score))
-            : 5,
-          quiz: Array.isArray(parsed.quiz) ? parsed.quiz.slice(0, 10).map(q => ({
-            type: QUIZ_TYPES.has(q.type) ? q.type : 'yes_no',
-            prompt: String(q.prompt || '').slice(0, 300),
-            sentence: String(q.sentence || '').slice(0, 300),
-            hindi: String(q.hindi || '').slice(0, 300),
-            options: Array.isArray(q.options) ? q.options.slice(0, 3).map(o => String(o).slice(0, 200)) : [],
-            correct_option: String(q.correct_option || '').slice(0, 200),
-            is_correct: typeof q.is_correct === 'boolean' ? q.is_correct : false,
-            expected_answer: String(q.expected_answer || '').slice(0, 300)
-          })) : [],
+          report_text: typeof rawText === 'string' ? rawText.trim().slice(0, 20000) : '',
           model_version: model,
-          raw_response: parsed
+          raw_response: { text: rawText }
         };
+
+        if (!safeReport.report_text) {
+          console.error('Analysis LLM returned empty content for session', sessionId);
+          return res.status(502).json({ error: 'Analysis failed — please try again.' });
+        }
 
         // UPDATE the claimed row (not insert) — the row already exists
         // (created by the claim step above), we're just filling it in.

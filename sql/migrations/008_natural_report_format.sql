@@ -1,78 +1,34 @@
--- Run this once in Supabase Dashboard -> SQL Editor.
+-- Run this once in Supabase Dashboard -> SQL Editor, after 007_commit_mode.sql.
+-- Additive only for the table (no columns dropped, no data destroyed) —
+-- the old structured-report columns (opening_line, strengths, mistakes,
+-- growth_note, focus_next, confidence_score, quiz) are left in place on
+-- session_reports, just no longer written to by new reports. Safe to
+-- re-run this file anytime.
+--
+-- WHAT CHANGED: the analysis report moved from a structured-JSON shape
+-- (rendered as separate cards/pills/a swipeable mistakes deck/a quiz) to
+-- a single natural-language Hinglish write-up (rendered as one flowing
+-- page on report.html). See routes/chatRoutes.js for the backend side
+-- of this change.
 
-create table if not exists profiles (
-  id uuid primary key references auth.users(id) on delete cascade,
-  email text,
-  display_name text,
-  created_at timestamptz default now(),
+-- ═══════════════════════════════════════════════════════════════
+-- New column: the whole report as one piece of natural-language text
+-- (Markdown-style **bold** for emphasis, blank lines between sections).
+-- report.html renders this directly instead of building cards from
+-- separate structured fields.
+-- ═══════════════════════════════════════════════════════════════
+alter table session_reports add column if not exists report_text text;
 
-  -- Onboarding data (collected once, right after signup)
-  name text,
-  age int,
-  occupation_type text,   -- student | professional
-  class_grade text,       -- only set when occupation_type = 'student'  (e.g. "Class 10", "B.Tech 2nd year")
-  profession text,        -- only set when occupation_type = 'professional' (e.g. "Software Engineer")
-  city text,
-  goal text,              -- interview | daily_confidence | exam_prep | travel | content_creation | general
-  self_level text,        -- beginner | intermediate | advanced
-  english_sample text,    -- free-text sample, saved now, analyzed later
-  daily_time text,        -- 5_10 | 15_20 | 30_plus
-  onboarding_completed boolean not null default false
-);
-
--- Chat history: one row per completed voice session, plus one row per
--- turn inside it. Frontend writes turns to local storage during the
--- session and pushes everything here in a single call once it ends
--- (see POST /chat/sessions) — so these tables only ever get one bulk
--- insert per session, not one write per turn.
-create table if not exists chat_sessions (
-  id uuid primary key default gen_random_uuid(),
-  user_id uuid not null references profiles(id) on delete cascade,
-  started_at timestamptz not null,
-  ended_at timestamptz not null,
-  turn_count int not null default 0,
-  created_at timestamptz default now()
-);
-
-create table if not exists chat_messages (
-  id uuid primary key default gen_random_uuid(),
-  session_id uuid not null references chat_sessions(id) on delete cascade,
-  role text not null check (role in ('user','assistant')),
-  content text not null,
-  turn_index int not null,
-  created_at timestamptz default now()
-);
-
-create index if not exists chat_messages_session_id_idx on chat_messages(session_id);
-create index if not exists chat_sessions_user_id_idx on chat_sessions(user_id);
-
-alter table chat_sessions enable row level security;
-alter table chat_messages enable row level security;
-
-drop policy if exists "Users can view own chat sessions" on chat_sessions;
-create policy "Users can view own chat sessions"
-  on chat_sessions for select
-  using (auth.uid() = user_id);
-
-drop policy if exists "Users can view own chat messages" on chat_messages;
-create policy "Users can view own chat messages"
-  on chat_messages for select
-  using (exists (
-    select 1 from chat_sessions
-    where chat_sessions.id = chat_messages.session_id
-    and chat_sessions.user_id = auth.uid()
-  ));
--- Editable system prompts — lets you tune the analysis LLM's behavior
--- from the Supabase dashboard directly, without a code deploy.
-create table if not exists prompt_configs (
-  key text primary key,
-  prompt text not null,
-  updated_at timestamptz default now()
-);
-
-insert into prompt_configs (key, prompt) values (
-  'chat_analysis',
-  'Tum ek English coach ho jo apne student ki practice call transcript padh ke uske liye ek natural, insaan-jaisa feedback report likhta ho — bilkul jaise koi teacher khud call sun ke, apne haath se likh raha ho. Yeh report kisi form, JSON, ya AI-generated document jaisa bilkul nahi lagna chahiye.
+-- ═══════════════════════════════════════════════════════════════
+-- Analysis prompt update — same prompt_configs row (key = 'chat_analysis'),
+-- new content. This is a plain UPDATE (not the schema.sql seed's
+-- "insert ... on conflict do nothing", which only fires on a brand new
+-- row) because this needs to actually overwrite the existing live row.
+-- schema.sql's seed text is also being kept in sync separately so a
+-- fresh install gets this same prompt from day one.
+-- ═══════════════════════════════════════════════════════════════
+update prompt_configs
+set prompt = 'Tum ek English coach ho jo apne student ki practice call transcript padh ke uske liye ek natural, insaan-jaisa feedback report likhta ho — bilkul jaise koi teacher khud call sun ke, apne haath se likh raha ho. Yeh report kisi form, JSON, ya AI-generated document jaisa bilkul nahi lagna chahiye.
 
 BAHUT ZAROORI: Transcript mein User ke saath ek AI Coach (jaise "Bolo") bhi baat kar raha hoga jo kabhi-kabhi live corrections deta hai. TUM UN LIVE CORRECTIONS PAR BHAROSA MAT KARO. Us AI coach ne jaan-boojh kar sirf kuch hi mistakes point out ki hain (kyunki live conversation mein sab kuch rokna flow todta hai) — baaki mistakes usne chhod di hain. Tumhara kaam hai POORI User ki English (uske saare turns) ko khud se, FRESH, ek naye expert teacher ki tarah dobara analyze karna aur JO BHI genuine mistakes milein — chahe AI coach ne unko point out kiya ho ya nahi — sabko is report mein cover karna.
 
@@ -279,120 +235,6 @@ Ek genuinely achhi baat — kaafi struggle karne ke baad bhi, tumne Hindi mein p
 
 ---
 
-Ab upar diye 4 examples jaisa hi format, depth, aur tone follow karke, niche di gayi NAYI transcript ko FRESH analyze karo (AI coach ke live corrections ko ignore karke) aur report likho. Sirf final report do, koi preamble ya extra explanation nahi.'
-) on conflict (key) do nothing;
-
--- RLS enabled, deliberately with NO policy for normal users. Without
--- this, the anon key (which ships publicly in config.js) could read
--- this table directly via the REST API — leaking the internal AI
--- prompt. Zero policies = deny-by-default; only the backend's
--- service-role client (which bypasses RLS entirely) can read it.
-alter table prompt_configs enable row level security;
-
--- One report per chat session (enforced by the unique constraint on
--- session_id) — matches the product decision that a session gets
--- analyzed once, on demand, not regenerated automatically.
-create table if not exists session_reports (
-  id uuid primary key default gen_random_uuid(),
-  session_id uuid not null unique references chat_sessions(id) on delete cascade,
-  user_id uuid not null references profiles(id) on delete cascade,
-  report_text text,      -- the whole report as one natural-language write-up (Markdown-style **bold**), rendered as-is by report.html
-  model_version text,
-  raw_response jsonb,    -- full original model output, kept for debugging/audit only
-  generated_at timestamptz default now(),
-  -- Old structured-report fields (opening_line/strengths/mistakes/
-  -- growth_note/focus_next/confidence_score/quiz) lived here before the
-  -- report moved to the single-natural-text shape above — see
-  -- sql/migrations/008_natural_report_format.sql. Kept only for any old
-  -- rows that still reference them; no longer written by the backend.
-  opening_line text,
-  strengths jsonb,
-  mistakes jsonb,
-  growth_note text,
-  focus_next text,
-  confidence_score integer,
-  quiz jsonb
-);
-
--- Safe to run again on an existing table (created before this report
--- shape existed) — adds the new columns without touching old data.
-alter table session_reports add column if not exists report_text text;
-alter table session_reports add column if not exists opening_line text;
-alter table session_reports add column if not exists growth_note text;
-alter table session_reports add column if not exists focus_next text;
-alter table session_reports add column if not exists confidence_score integer;
-alter table session_reports add column if not exists quiz jsonb;
--- Old fields from a previous report shape — no longer produced by the
--- backend. Drop only once you're sure no old report data needs them.
--- alter table session_reports drop column if exists summary;
--- alter table session_reports drop column if exists practice_tip;
-
-create index if not exists session_reports_user_id_idx on session_reports(user_id);
-
-alter table session_reports enable row level security;
-drop policy if exists "Users can view own reports" on session_reports;
-create policy "Users can view own reports"
-  on session_reports for select
-  using (auth.uid() = user_id);
--- No insert/update policy — only the backend's admin client writes here.
-
--- Safe to run again on an existing table — adds columns only if missing.
-alter table profiles add column if not exists name text;
-alter table profiles add column if not exists age int;
-alter table profiles add column if not exists occupation_type text;
-alter table profiles add column if not exists class_grade text;
-alter table profiles add column if not exists profession text;
-alter table profiles add column if not exists city text;
-alter table profiles add column if not exists goal text;
-alter table profiles add column if not exists self_level text;
-alter table profiles add column if not exists english_sample text;
-alter table profiles add column if not exists daily_time text;
-alter table profiles add column if not exists onboarding_completed boolean not null default false;
-
--- One-time cleanup if you already ran the older version of this schema
--- that had a single ambiguous "age_or_class" text column.
-alter table profiles drop column if exists age_or_class;
-
-alter table profiles enable row level security;
-
--- Users can only ever see/update their own row.
--- (The backend's admin/service-role client bypasses these for auto-creation.)
--- drop-then-create makes this block safe to re-run anytime.
-drop policy if exists "Users can view own profile" on profiles;
-create policy "Users can view own profile"
-  on profiles for select
-  using (auth.uid() = id);
-
-drop policy if exists "Users can update own profile" on profiles;
-create policy "Users can update own profile"
-  on profiles for update
-  using (auth.uid() = id);
-
--- DB-level guardrails matching the VALID_* lists already enforced in
--- routes/userRoutes.js. App-level validation is the primary defense (it
--- runs first and gives a friendly error message) — these constraints are
--- a second layer, in case anything ever writes to this table without
--- going through the backend (a future admin panel, a manual SQL edit,
--- a migration script). NULL is still allowed (a profile can be mid-
--- onboarding with these fields unset yet), only *non-null, invalid*
--- values are rejected. "add constraint if not exists" isn't valid
--- Postgres syntax, so each block below drops-then-adds, same pattern
--- used for the policies above — safe to re-run this file anytime.
-do $$
-begin
-  alter table profiles drop constraint if exists profiles_occupation_type_check;
-  alter table profiles add constraint profiles_occupation_type_check
-    check (occupation_type is null or occupation_type in ('student', 'professional'));
-
-  alter table profiles drop constraint if exists profiles_goal_check;
-  alter table profiles add constraint profiles_goal_check
-    check (goal is null or goal in ('interview', 'daily_confidence', 'exam_prep', 'travel', 'content_creation', 'general'));
-
-  alter table profiles drop constraint if exists profiles_self_level_check;
-  alter table profiles add constraint profiles_self_level_check
-    check (self_level is null or self_level in ('beginner', 'intermediate', 'advanced'));
-
-  alter table profiles drop constraint if exists profiles_daily_time_check;
-  alter table profiles add constraint profiles_daily_time_check
-    check (daily_time is null or daily_time in ('5_10', '15_20', '30_plus'));
-end $$;
+Ab upar diye 4 examples jaisa hi format, depth, aur tone follow karke, niche di gayi NAYI transcript ko FRESH analyze karo (AI coach ke live corrections ko ignore karke) aur report likho. Sirf final report do, koi preamble ya extra explanation nahi.',
+    updated_at = now()
+where key = 'chat_analysis';
