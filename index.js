@@ -51,6 +51,7 @@ const chatRoutes = require('./routes/chatRoutes');
 const scenarioRoutes = require('./routes/scenarioRoutes');
 const paymentRoutes = require('./routes/paymentRoutes');
 const adminRoutes = require('./routes/adminRoutes');
+const announcementRoutes = require('./routes/announcementRoutes');
 
 const app = express();
 // Render (and most PaaS hosts) sit in front of this app as a reverse
@@ -174,6 +175,7 @@ app.use('/payments', (req, res, next) => (req.method === 'GET' ? next() : writeL
 // endpoint gated by ADMIN_SECRET (see adminRoutes.js), not a per-user
 // action, so the per-user write budget doesn't apply here.
 app.use('/admin', adminRoutes);
+app.use('/announcements', announcementRoutes);
 
 app.use(notFoundHandler);
 if (process.env.SENTRY_DSN) Sentry.setupExpressErrorHandler(app); // reports to Sentry, then falls through

@@ -5,6 +5,7 @@ const { requirePlan } = require('../middleware/requirePlan');
 const { supabaseAdmin } = require('../lib/supabaseClient');
 const { startOfUtcDay } = require('../lib/scenarioSelector');
 const { recordCommitModeProgress, getTodaysCommitModeProgress } = require('../lib/commitMode');
+const { getUserStreak } = require('../lib/streak');
 const OpenAI = require('openai');
 
 const SESSION_TYPES = new Set(['freeform', 'scenario']);
@@ -134,6 +135,15 @@ router.get('/commit-mode/today', requireAuth, async (req, res, next) => {
     if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
     const progress = await getTodaysCommitModeProgress(req.user.id);
     res.json(progress);
+  } catch (err) { next(err); }
+});
+
+// GET /chat/streak — returns the user's real calculated day streak (in IST).
+router.get('/streak', requireAuth, async (req, res, next) => {
+  try {
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+    const streak = await getUserStreak(req.user.id);
+    res.json(streak);
   } catch (err) { next(err); }
 });
 
