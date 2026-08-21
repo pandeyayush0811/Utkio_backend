@@ -76,7 +76,7 @@ async function resolveToEmail(identifier) {
     .from('profiles')
     .select('email')
     .eq('phone', phone)
-    .order('updated_at', { ascending: false })
+    .order('created_at', { ascending: false })
     .limit(1)
     .maybeSingle();
   if (error) {
@@ -356,3 +356,4 @@ router.post('/refresh', async (req, res, next) => {
 });
 
 module.exports = router;
+module.exports.resolveToEmail = resolveToEmail; // exported for testing only

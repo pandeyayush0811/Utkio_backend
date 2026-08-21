@@ -44,6 +44,7 @@ create table if not exists chat_messages (
 );
 
 create index if not exists chat_messages_session_id_idx on chat_messages(session_id);
+create unique index if not exists chat_messages_session_turn_idx on chat_messages(session_id, turn_index);
 create index if not exists chat_sessions_user_id_idx on chat_sessions(user_id);
 
 alter table chat_sessions enable row level security;

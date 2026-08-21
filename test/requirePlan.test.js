@@ -109,3 +109,15 @@ test('passes a Postgres/RPC error to next() instead of swallowing it', async () 
   assert.strictEqual(res.statusCode, null); // response left untouched — errorHandler deals with it
   mock.restoreAll();
 });
+
+test('rejects with 402 when RPC reports trial_not_started or user_not_found', async () => {
+  mock.method(supabaseAdmin, 'rpc', async () => ({ data: [{ allowed: false, reason: 'trial_not_started' }], error: null }));
+
+  const req = { user: { id: 'user-7' } };
+  const res = mockRes();
+  await requirePlan('chat')(req, res, () => {});
+
+  assert.strictEqual(res.statusCode, 402);
+  assert.strictEqual(res.body.reason, 'trial_not_started');
+  mock.restoreAll();
+});

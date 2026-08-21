@@ -197,3 +197,38 @@ test('logout still succeeds for the client even if Supabase signOut itself error
 
   mock.restoreAll();
 });
+
+test('resolveToEmail: resolves plain email addresses directly without DB query', async () => {
+  const { resolveToEmail } = require('../routes/authRoutes');
+  assert.strictEqual(await resolveToEmail('test@example.com'), 'test@example.com');
+  assert.strictEqual(await resolveToEmail('USER@DOMAIN.IN'), 'user@domain.in');
+  assert.strictEqual(await resolveToEmail(''), null);
+  assert.strictEqual(await resolveToEmail(null), null);
+  assert.strictEqual(await resolveToEmail('invalid-phone-or-email'), null);
+});
+
+test('resolveToEmail: queries profiles ordered by created_at desc for valid Indian phone', async () => {
+  const { resolveToEmail } = require('../routes/authRoutes');
+  let queriedOrderColumn = null;
+
+  mock.method(supabaseAdmin, 'from', () => ({
+    select: () => ({
+      eq: () => ({
+        order: (col, opts) => {
+          queriedOrderColumn = col;
+          return {
+            limit: () => ({
+              maybeSingle: async () => ({ data: { email: 'found@example.com' }, error: null })
+            })
+          };
+        }
+      })
+    })
+  }));
+
+  const res = await resolveToEmail('9876543210');
+  assert.strictEqual(res, 'found@example.com');
+  assert.strictEqual(queriedOrderColumn, 'created_at'); // confirms created_at, not non-existent updated_at
+
+  mock.restoreAll();
+});

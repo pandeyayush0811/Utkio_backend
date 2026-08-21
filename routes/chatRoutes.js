@@ -242,7 +242,9 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
             turn_index: startIndex + i
           }));
 
-          const { error: insertErr } = await supabaseAdmin.from('chat_messages').insert(rows);
+          const { error: insertErr } = await supabaseAdmin
+            .from('chat_messages')
+            .upsert(rows, { onConflict: 'session_id,turn_index', ignoreDuplicates: true });
           if (insertErr) return next(insertErr); // 5xx internals stay server-side only — see errorHandler.js
 
           const newTurnCount = startIndex + rows.length;
@@ -289,7 +291,9 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
         if (sessionErr) return next(sessionErr);
 
         const rows = messages.map((m, i) => ({ session_id: session.id, role: m.role, content: m.content.trim(), turn_index: i }));
-        const { error: messagesErr } = await supabaseAdmin.from('chat_messages').insert(rows);
+        const { error: messagesErr } = await supabaseAdmin
+          .from('chat_messages')
+          .upsert(rows, { onConflict: 'session_id,turn_index', ignoreDuplicates: true });
 
         if (messagesErr) {
           await supabaseAdmin.from('chat_sessions').delete().eq('id', session.id); // don't leave an orphaned empty session
