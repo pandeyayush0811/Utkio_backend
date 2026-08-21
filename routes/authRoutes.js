@@ -76,6 +76,8 @@ async function resolveToEmail(identifier) {
     .from('profiles')
     .select('email')
     .eq('phone', phone)
+    .order('updated_at', { ascending: false })
+    .limit(1)
     .maybeSingle();
   if (error) {
     console.error('resolveToEmail: profiles lookup failed:', error.message);
@@ -155,20 +157,6 @@ router.post('/signup/verify', async (req, res, next) => {
     if (pwSetError) {
       console.error('signup/verify: failed to set password:', pwSetError.message);
       return res.status(500).json({ error: 'Could not complete signup. Please try again.' });
-    }
-
-    // Enforce phone uniqueness ourselves (profiles.phone has a unique
-    // index, but that only fires at the DB level after we've already
-    // created the auth user above — check first so we can give a clean
-    // 409 instead of a raw constraint-violation 500).
-    const { data: existingPhone } = await supabaseAdmin
-      .from('profiles')
-      .select('id')
-      .eq('phone', phone)
-      .neq('id', data.user.id)
-      .maybeSingle();
-    if (existingPhone) {
-      return res.status(409).json({ error: 'This mobile number is already registered with another account.' });
     }
 
     clearOtpState(email);

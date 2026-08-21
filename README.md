@@ -1,7 +1,7 @@
 # Uktio Backend
 
 Express API backend for the Uktio app — handles auth, profile, chat-history
-sync, and AI-generated session reports/quizzes. Database is Supabase
+sync, and AI-generated session reports. Database is Supabase
 (Postgres + Auth + Row Level Security).
 
 ## Architecture, in short
@@ -20,7 +20,7 @@ sync, and AI-generated session reports/quizzes. Database is Supabase
   key, entered in Settings). This backend never sees or proxies that
   audio traffic — it only receives the finished transcript once a
   session ends (`POST /chat/sessions`), and generates the post-session
-  report/quiz via OpenAI (`POST /chat/sessions/:id/analyze`).
+  report via OpenAI (`POST /chat/sessions/:id/analyze`).
 - **Rate limiting**: in-memory by default (fine for a single server
   instance). If you ever run 2+ instances behind a load balancer, set
   `REDIS_URL` — see `.env.example` and `middleware/rateLimiter.js`.
@@ -74,7 +74,7 @@ middleware/
 routes/
   authRoutes.js               Signup/login/Google auth
   userRoutes.js                Profile CRUD, onboarding
-  chatRoutes.js                 Session sync, report generation, report/quiz retrieval
+  chatRoutes.js                 Session sync, report generation, report retrieval
 sql/schema.sql               Full DB schema — run in Supabase SQL Editor
 test/                          Unit tests (node:test, no DB/network needed)
 ```

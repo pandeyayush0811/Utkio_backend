@@ -38,33 +38,60 @@ async function post(app, path, body, headers = {}) {
   }
 }
 
-test('signup rejects a password shorter than the minimum', async () => {
+test('signup/otp rejects invalid email or phone', async () => {
   const app = buildApp();
-  const { status, data } = await post(app, '/auth/signup', { email: 'a@example.com', password: 'short' });
+  const res1 = await post(app, '/auth/signup/otp', { email: 'bad-email', phone: '9876543210' });
+  assert.strictEqual(res1.status, 400);
+  assert.match(res1.data.error, /valid email address/);
+
+  const res2 = await post(app, '/auth/signup/otp', { email: 'valid@example.com', phone: '123' });
+  assert.strictEqual(res2.status, 400);
+  assert.match(res2.data.error, /valid 10-digit Indian mobile number/);
+});
+
+test('signup/verify rejects a password shorter than the minimum', async () => {
+  const app = buildApp();
+  const { status, data } = await post(app, '/auth/signup/verify', {
+    email: 'a@example.com',
+    phone: '9876543210',
+    token: '123456',
+    password: 'short'
+  });
   assert.strictEqual(status, 400);
   assert.match(data.error, /at least 8 characters/);
 });
 
-test('signup accepts a valid password and forwards to Supabase', async () => {
-  mock.method(supabaseAnon.auth, 'signUp', async ({ email, password }) => {
+test('signup/verify accepts valid OTP and password, sets password and ensures profile without phone 409 collision', async () => {
+  mock.method(supabaseAnon.auth, 'verifyOtp', async ({ email, token, type }) => {
     assert.strictEqual(email, 'a@example.com');
-    assert.strictEqual(password, 'longenoughpassword');
+    assert.strictEqual(token, '123456');
+    assert.strictEqual(type, 'email');
     return { data: { user: { id: 'u1', email }, session: { access_token: 'tok' } }, error: null };
+  });
+  mock.method(supabaseAdmin.auth.admin, 'updateUserById', async (userId, { password }) => {
+    assert.strictEqual(userId, 'u1');
+    assert.strictEqual(password, 'longenoughpassword');
+    return { error: null };
   });
   mock.method(supabaseAdmin, 'from', () => ({
     upsert: async () => ({ error: null })
   }));
 
   const app = buildApp();
-  const { status, data } = await post(app, '/auth/signup', { email: 'a@example.com', password: 'longenoughpassword' });
+  const { status, data } = await post(app, '/auth/signup/verify', {
+    email: 'a@example.com',
+    phone: '9876543210',
+    token: '123456',
+    password: 'longenoughpassword'
+  });
   assert.strictEqual(status, 201);
   assert.strictEqual(data.user.id, 'u1');
   mock.restoreAll();
 });
 
 test('login locks out an account after repeated failures, independent of IP-level rate limiting', async () => {
-  const email = 'locktest@example.com';
-  clearFailedLogins(email);
+  const identifier = 'locktest@example.com';
+  clearFailedLogins(identifier);
 
   mock.method(supabaseAnon.auth, 'signInWithPassword', async () => ({
     data: { user: null, session: null },
@@ -73,31 +100,31 @@ test('login locks out an account after repeated failures, independent of IP-leve
 
   const app = buildApp();
 
-  // First 5 attempts: each fails with Supabase's own message.
+  // First 5 attempts: each fails with generic Invalid credentials.
   for (let i = 0; i < 5; i++) {
-    const { status, data } = await post(app, '/auth/login', { email, password: 'wrong' });
+    const { status, data } = await post(app, '/auth/login', { identifier, password: 'wrong' });
     assert.strictEqual(status, 401);
-    assert.strictEqual(data.error, 'Invalid login credentials');
+    assert.strictEqual(data.error, 'Invalid credentials.');
   }
 
   // 6th attempt: the account-level lock kicks in BEFORE Supabase is even
   // called — even if this were a correct password now, it's rejected.
-  const { status, data } = await post(app, '/auth/login', { email, password: 'wrong' });
+  const { status, data } = await post(app, '/auth/login', { identifier, password: 'wrong' });
   assert.strictEqual(status, 429);
   assert.match(data.error, /Too many failed attempts/);
 
   mock.restoreAll();
-  clearFailedLogins(email);
+  clearFailedLogins(identifier);
 });
 
 test('a successful login clears any accumulated failure count for that account', async () => {
-  const email = 'recovers@example.com';
-  clearFailedLogins(email);
+  const identifier = 'recovers@example.com';
+  clearFailedLogins(identifier);
 
   let shouldSucceed = false;
   mock.method(supabaseAnon.auth, 'signInWithPassword', async () => {
     if (shouldSucceed) {
-      return { data: { user: { id: 'u2', email }, session: { access_token: 'tok' } }, error: null };
+      return { data: { user: { id: 'u2', email: identifier }, session: { access_token: 'tok' } }, error: null };
     }
     return { data: { user: null, session: null }, error: { message: 'Invalid login credentials' } };
   });
@@ -106,19 +133,19 @@ test('a successful login clears any accumulated failure count for that account',
   const app = buildApp();
 
   // A few failures, then the correct password.
-  await post(app, '/auth/login', { email, password: 'wrong' });
-  await post(app, '/auth/login', { email, password: 'wrong' });
+  await post(app, '/auth/login', { identifier, password: 'wrong' });
+  await post(app, '/auth/login', { identifier, password: 'wrong' });
 
   shouldSucceed = true;
-  const ok = await post(app, '/auth/login', { email, password: 'right' });
+  const ok = await post(app, '/auth/login', { identifier, password: 'right' });
   assert.strictEqual(ok.status, 200);
 
   // Failure count should be reset — this account is not still "part way locked".
-  const again = await post(app, '/auth/login', { email, password: 'wrong-again' });
+  const again = await post(app, '/auth/login', { identifier, password: 'wrong-again' });
   assert.notStrictEqual(again.status, 429);
 
   mock.restoreAll();
-  clearFailedLogins(email);
+  clearFailedLogins(identifier);
 });
 
 test('logout calls Supabase admin signOut with the caller\'s own token and global scope', async () => {

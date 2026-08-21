@@ -2,7 +2,7 @@ const { supabaseAdmin } = require('../lib/supabaseClient');
 const { TRIAL_DAYS, TRIAL_CHAT_LIMIT, TRIAL_REPORT_LIMIT } = require('../lib/accessLimits');
 
 // Protects a route that costs backend money: saving a chat session or
-// generating a report/quiz (analyze). Must run AFTER requireAuth (needs
+// generating a report (analyze). Must run AFTER requireAuth (needs
 // req.user.id already set).
 //
 // Access is granted if EITHER is true:
@@ -20,7 +20,7 @@ const { TRIAL_DAYS, TRIAL_CHAT_LIMIT, TRIAL_REPORT_LIMIT } = require('../lib/acc
 //
 // requirePlan('chat') and requirePlan('report') are the two call sites
 // today (POST /chat/sessions and POST /chat/sessions/:id/analyze).
-// Reading already-generated data (history, report, mistakes/quiz review)
+// Reading already-generated data (history, report)
 // is intentionally NEVER gated by this — it's a free read of something
 // already paid for once at generation time.
 function requirePlan(kind) {
