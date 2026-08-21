@@ -363,10 +363,10 @@ create policy "Users can view own profile"
   on profiles for select
   using (auth.uid() = id);
 
+-- Direct UPDATE is intentionally disabled for authenticated role: all profile
+-- writes must go through the Express backend (supabaseAdmin / service-role)
+-- to protect plan, trial limits, and commit mode fields from direct PostgREST tampering.
 drop policy if exists "Users can update own profile" on profiles;
-create policy "Users can update own profile"
-  on profiles for update
-  using (auth.uid() = id);
 
 -- DB-level guardrails matching the VALID_* lists already enforced in
 -- routes/userRoutes.js. App-level validation is the primary defense (it
