@@ -1,32 +1,15 @@
 const { supabaseAdmin } = require('../lib/supabaseClient');
-const { TRIAL_DAYS, TRIAL_CHAT_LIMIT, TRIAL_REPORT_LIMIT } = require('../lib/accessLimits');
+const { TRIAL_DAYS, TRIAL_CHAT_LIMIT, TRIAL_REPORT_LIMIT, TRIAL_SCENARIO_LIMIT } = require('../lib/accessLimits');
 
-// Protects a route that costs backend money: saving a chat session or
-// generating a report (analyze). Must run AFTER requireAuth (needs
-// req.user.id already set).
-//
-// Access is granted if EITHER is true:
-//   1. profiles.plan is an active, non-expired paid plan (starter/unlimited)
-//      — unchanged from before, still fully uncapped.
-//   2. The user is within their free trial window (TRIAL_DAYS from signup)
-//      AND still has credits left for this specific kind of action
-//      (TRIAL_CHAT_LIMIT for 'chat', TRIAL_REPORT_LIMIT for 'report' —
-//      two independent counters, not a shared pool).
-//
-// The check-and-increment for (2) happens atomically in Postgres via
-// consume_access() (see migrations/004_trial_and_usage_limits.sql) so a
-// user firing two requests at once can't both consume the same last
-// credit — a plain "select count then update" here in JS would race.
-//
-// requirePlan('chat') and requirePlan('report') are the two call sites
-// today (POST /chat/sessions and POST /chat/sessions/:id/analyze).
-// Reading already-generated data (history, report)
-// is intentionally NEVER gated by this — it's a free read of something
-// already paid for once at generation time.
+// Protects a route that costs backend money: saving a chat session,
+// saving a scenario session, or generating a report (analyze).
+// Must run AFTER requireAuth (needs req.user.id already set).
 function requirePlan(kind) {
-  if (kind !== 'chat' && kind !== 'report') {
-    throw new Error(`requirePlan(kind): kind must be 'chat' or 'report', got ${JSON.stringify(kind)}`);
+  if (kind !== 'chat' && kind !== 'report' && kind !== 'scenario') {
+    throw new Error(`requirePlan(kind): kind must be 'chat', 'report', or 'scenario', got ${JSON.stringify(kind)}`);
   }
+
+  const limit = kind === 'chat' ? TRIAL_CHAT_LIMIT : (kind === 'scenario' ? TRIAL_SCENARIO_LIMIT : TRIAL_REPORT_LIMIT);
 
   return async function (req, res, next) {
     try {
@@ -38,7 +21,7 @@ function requirePlan(kind) {
         p_user_id: req.user.id,
         p_kind: kind,
         p_trial_days: TRIAL_DAYS,
-        p_trial_limit: kind === 'chat' ? TRIAL_CHAT_LIMIT : TRIAL_REPORT_LIMIT
+        p_trial_limit: limit
       });
 
       if (error) return next(error);
@@ -61,12 +44,13 @@ function requirePlan(kind) {
 }
 
 function accessDeniedMessage(reason, kind) {
-  const what = kind === 'chat' ? 'session' : 'report';
+  const what = kind === 'chat' ? 'practice session' : (kind === 'scenario' ? 'scenario simulation' : 'report');
+  const limit = kind === 'chat' ? TRIAL_CHAT_LIMIT : (kind === 'scenario' ? TRIAL_SCENARIO_LIMIT : TRIAL_REPORT_LIMIT);
   switch (reason) {
     case 'trial_expired':
       return 'Tumhara 3-din ka free trial khatam ho gaya hai — jaari rakhne ke liye plan lo.';
     case 'trial_limit_reached':
-      return `Tumhare free trial ke ${kind === 'chat' ? TRIAL_CHAT_LIMIT : TRIAL_REPORT_LIMIT} free ${what}s use ho chuke hain — jaari rakhne ke liye plan lo.`;
+      return `Tumhare free trial ke ${limit} free ${what}${limit > 1 ? 's' : ''} use ho chuke hain — jaari rakhne ke liye plan lo.`;
     case 'trial_not_started':
     case 'user_not_found':
     default:

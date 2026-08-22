@@ -18,7 +18,7 @@ function mockRes() {
 }
 
 test('requirePlan(kind) throws synchronously for an invalid kind — fails loud at wiring time, not at request time', () => {
-  assert.throws(() => requirePlan('bogus'), /kind must be 'chat' or 'report'/);
+  assert.throws(() => requirePlan('bogus'), /kind must be 'chat', 'report', or 'scenario'/);
 });
 
 test('allows the request through when consume_access reports an active paid plan', async () => {
@@ -81,7 +81,7 @@ test('rejects with 402 + trial_limit_reached message once free credits are used 
   mock.restoreAll();
 });
 
-test('chat and report kinds are independent — each passes its own p_kind through to the RPC', async () => {
+test('chat, scenario, and report kinds are independent — each passes its own p_kind through to the RPC', async () => {
   const seenKinds = [];
   mock.method(supabaseAdmin, 'rpc', async (fn, args) => {
     seenKinds.push(args.p_kind);
@@ -90,9 +90,10 @@ test('chat and report kinds are independent — each passes its own p_kind throu
 
   const req = { user: { id: 'user-5' } };
   await requirePlan('chat')(req, mockRes(), () => {});
+  await requirePlan('scenario')(req, mockRes(), () => {});
   await requirePlan('report')(req, mockRes(), () => {});
 
-  assert.deepStrictEqual(seenKinds, ['chat', 'report']);
+  assert.deepStrictEqual(seenKinds, ['chat', 'scenario', 'report']);
   mock.restoreAll();
 });
 

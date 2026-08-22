@@ -4,7 +4,7 @@ const router = express.Router();
 const { requireAuth } = require('../middleware/authMiddleware');
 const { supabaseAdmin } = require('../lib/supabaseClient');
 const { razorpay } = require('../lib/razorpayClient');
-const { TRIAL_DAYS, TRIAL_CHAT_LIMIT, TRIAL_REPORT_LIMIT } = require('../lib/accessLimits');
+const { TRIAL_DAYS, TRIAL_CHAT_LIMIT, TRIAL_REPORT_LIMIT, TRIAL_SCENARIO_LIMIT } = require('../lib/accessLimits');
 const { verifyHmacSignature } = require('../lib/verifySignature');
 // PLAN_PRICES_PAISE, PLAN_VALIDITY_DAYS and activatePlan now live in
 // lib/planActivation.js — shared with the reconciliation job (see
@@ -515,14 +515,16 @@ router.get('/status', requireAuth, async (req, res, next) => {
       p_user_id: req.user.id,
       p_trial_days: TRIAL_DAYS,
       p_trial_limit_chats: TRIAL_CHAT_LIMIT,
-      p_trial_limit_reports: TRIAL_REPORT_LIMIT
+      p_trial_limit_reports: TRIAL_REPORT_LIMIT,
+      p_trial_limit_scenarios: TRIAL_SCENARIO_LIMIT
     });
     if (trialError) return next(trialError);
     const trial = Array.isArray(trialData) ? trialData[0] : trialData;
 
     const canChat = hasPaidPlan || Boolean(trial && trial.trial_active && trial.chats_remaining > 0);
     const canReport = hasPaidPlan || Boolean(trial && trial.trial_active && trial.reports_remaining > 0);
-    const active = hasPaidPlan || Boolean(trial && trial.trial_active && (trial.chats_remaining > 0 || trial.reports_remaining > 0));
+    const canScenario = hasPaidPlan || Boolean(trial && trial.trial_active && trial.scenarios_remaining > 0);
+    const active = hasPaidPlan || Boolean(trial && trial.trial_active && (trial.chats_remaining > 0 || trial.reports_remaining > 0 || trial.scenarios_remaining > 0));
 
     res.json({
       plan: data.plan,
@@ -530,6 +532,7 @@ router.get('/status', requireAuth, async (req, res, next) => {
       active,
       can_chat: canChat,
       can_report: canReport,
+      can_scenario: canScenario,
       // Only meaningful right after a termination — the frontend shows a
       // one-time explanation banner (see settings.html) then this stays
       // in the response forever after (harmless; a stale historical
@@ -541,8 +544,10 @@ router.get('/status', requireAuth, async (req, res, next) => {
         days_left: trial ? Math.max(0, Math.floor(Number(trial.trial_days_left) * 10) / 10) : 0,
         chats_remaining: trial ? trial.chats_remaining : 0,
         reports_remaining: trial ? trial.reports_remaining : 0,
+        scenarios_remaining: trial ? trial.scenarios_remaining : 0,
         chat_limit: TRIAL_CHAT_LIMIT,
-        report_limit: TRIAL_REPORT_LIMIT
+        report_limit: TRIAL_REPORT_LIMIT,
+        scenario_limit: TRIAL_SCENARIO_LIMIT
       }
     });
   } catch (err) { next(err); }

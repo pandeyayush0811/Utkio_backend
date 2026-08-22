@@ -177,7 +177,8 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
     // validation would burn a trial credit on a malformed request that was
     // never going to succeed (bad timestamp, empty messages, etc.), silently
     // draining a user's free trial for nothing.
-    requirePlan('chat')(req, res, async () => {
+    const planKind = resolvedSessionType === 'scenario' ? 'scenario' : 'chat';
+    requirePlan(planKind)(req, res, async () => {
       try {
         // Server-side enforcement of "one scenario per day" — the real
         // boundary (GET /chat/scenario/today's already_completed_today is
