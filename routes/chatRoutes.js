@@ -3,7 +3,7 @@ const router = express.Router();
 const { requireAuth } = require('../middleware/authMiddleware');
 const { requirePlan } = require('../middleware/requirePlan');
 const { supabaseAdmin } = require('../lib/supabaseClient');
-const { startOfUtcDay } = require('../lib/scenarioSelector');
+const { startOfIstDay } = require('../lib/scenarioSelector');
 const { recordCommitModeProgress, getTodaysCommitModeProgress } = require('../lib/commitMode');
 const { getUserStreak } = require('../lib/streak');
 const OpenAI = require('openai');
@@ -188,7 +188,7 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
         // already-started one (session_id set) is a continuation of the
         // SAME day's attempt, not a new one, so it's exempt.
         if (!session_id && resolvedSessionType === 'scenario') {
-          const todayStart = startOfUtcDay(new Date()).toISOString();
+          const todayStart = startOfIstDay(new Date()).toISOString();
           const { data: todaysScenarioSession, error: todayCheckErr } = await supabaseAdmin
             .from('chat_sessions')
             .select('id')

@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { requireAuth } = require('../middleware/authMiddleware');
 const { supabaseAdmin } = require('../lib/supabaseClient');
-const { pickTodaysScenario, startOfUtcDay } = require('../lib/scenarioSelector');
+const { pickTodaysScenario, startOfIstDay } = require('../lib/scenarioSelector');
 
 // GET /chat/scenario/today
 //
@@ -43,8 +43,8 @@ router.get('/today', requireAuth, async (req, res, next) => {
     if (lastErr) return next(lastErr);
 
     const now = new Date();
-    const today = startOfUtcDay(now).getTime();
-    const lastSessionDay = lastScenarioSession ? startOfUtcDay(new Date(lastScenarioSession.started_at)).getTime() : null;
+    const today = startOfIstDay(now).getTime();
+    const lastSessionDay = lastScenarioSession ? startOfIstDay(new Date(lastScenarioSession.started_at)).getTime() : null;
 
     // IMPORTANT: only feed lastScenarioKey into the anti-repeat check when
     // it's from a PRIOR day. If we always passed it, then calling this
