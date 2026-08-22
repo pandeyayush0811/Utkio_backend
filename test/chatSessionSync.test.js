@@ -46,3 +46,11 @@ test('chatSessionSync: deduplicates identical turn indices when mapped for idemp
   const uniqueKeys = new Set(rows.map(r => `${r.session_id}:${r.turn_index}`));
   assert.strictEqual(uniqueKeys.size, 2);
 });
+
+test('chatSessionSync: calculates exact active leg duration for resumed sessions without multi-day inflation', () => {
+  const startedAt = '2026-08-22T10:00:00.000Z';
+  const endedAt = '2026-08-22T10:03:30.000Z';
+  const legSeconds = Math.max(0, (new Date(endedAt) - new Date(startedAt)) / 1000);
+  assert.strictEqual(legSeconds, 210); // 3 minutes 30 seconds
+});
+

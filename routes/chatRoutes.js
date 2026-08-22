@@ -173,17 +173,10 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
     if (sessionTypeCheck.error) return res.status(400).json({ error: sessionTypeCheck.error });
     const resolvedSessionType = sessionTypeCheck.resolvedSessionType;
 
-    // Body is valid — only NOW check plan/trial access. Doing this before
-    // validation would burn a trial credit on a malformed request that was
-    // never going to succeed (bad timestamp, empty messages, etc.), silently
-    // draining a user's free trial for nothing.
-    const planKind = resolvedSessionType === 'scenario' ? 'scenario' : 'chat';
-    requirePlan(planKind)(req, res, async () => {
+    // Function to handle the actual database insertion / resume once plan check passes (or is bypassed for resumes)
+    const handleSessionSave = async () => {
       try {
-        // Server-side enforcement of "one scenario per day" — the real
-        // boundary (GET /chat/scenario/today's already_completed_today is
-        // a courtesy for the UI, same relationship as
-        // requireActivePlan()/requirePlan() elsewhere in this app). Only
+        // Server-side enforcement of "one scenario per day" — only
         // applies to brand-new scenario sessions: resuming an
         // already-started one (session_id set) is a continuation of the
         // SAME day's attempt, not a new one, so it's exempt.
@@ -256,20 +249,12 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
 
           if (updateErr) return next(updateErr);
 
-          // Commit Mode progress: only meaningful for freeform ('chat')
-          // sessions — a resumed scenario session isn't a thing today
-          // (scenario.html has no resume flow, see CODEBASE_MAP.md), but
-          // the session_type check here is cheap insurance either way.
-          // Incremental elapsed time = new ended_at minus the PREVIOUS
-          // ended_at (not started_at), so re-syncing an already-counted
-          // stretch of a resumed conversation never double-counts it
-          // toward today's 5-minute requirement — this is a fire-and-
-          // forget best-effort call (see recordCommitModeProgress's own
-          // doc comment for why it never blocks or fails this response).
+          // Commit Mode progress: only meaningful for freeform ('chat') sessions.
+          // Resumed session progress uses the actual elapsed duration of this leg (ended_at - started_at)
+          // instead of the multi-day wall-clock gap from previous leg's ended_at.
           if (resolvedSessionType === 'freeform') {
-            const previousEndedAt = existing.ended_at ? new Date(existing.ended_at) : new Date(started_at);
-            const deltaSeconds = (new Date(ended_at) - previousEndedAt) / 1000;
-            recordCommitModeProgress({ userId: req.user.id, kind: 'chat', seconds: deltaSeconds, at: new Date(ended_at) });
+            const legSeconds = Math.max(0, (new Date(ended_at) - new Date(started_at)) / 1000);
+            recordCommitModeProgress({ userId: req.user.id, kind: 'chat', seconds: legSeconds, at: new Date(ended_at) });
           }
 
           return res.json({ session_id, turn_count: newTurnCount });
@@ -301,18 +286,23 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
           return next(messagesErr);
         }
 
-        // Commit Mode progress — fire-and-forget, see the resume-mode
-        // call site above for the full rationale. For a brand new
-        // session, elapsed = ended_at - started_at as reported by the
-        // client (same duration signal the app already trusts for
-        // started_at/ended_at generally — no new trust boundary here).
-        const kind = resolvedSessionType === 'scenario' ? 'scenario' : 'chat';
-        const elapsedSeconds = kind === 'chat' ? (new Date(ended_at) - new Date(started_at)) / 1000 : 0;
-        recordCommitModeProgress({ userId: req.user.id, kind, seconds: elapsedSeconds, at: new Date(ended_at) });
+        if (resolvedSessionType === 'freeform') {
+          const durationSeconds = (new Date(ended_at) - new Date(started_at)) / 1000;
+          recordCommitModeProgress({ userId: req.user.id, kind: 'chat', seconds: durationSeconds, at: new Date(ended_at) });
+        }
 
-        res.json({ session_id: session.id, turn_count: rows.length });
+        return res.json({ session_id: session.id, turn_count: session.turn_count });
       } catch (err) { next(err); }
-    });
+    };
+
+    // Resuming an existing session is a continuation of an already-started session and does not consume a new chat credit.
+    // Brand new sessions require active plan / free trial credit.
+    if (session_id) {
+      await handleSessionSave();
+    } else {
+      const planKind = resolvedSessionType === 'scenario' ? 'scenario' : 'chat';
+      requirePlan(planKind)(req, res, handleSessionSave);
+    }
   } catch (err) { next(err); }
 });
 
