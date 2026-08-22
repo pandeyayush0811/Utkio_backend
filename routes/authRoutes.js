@@ -162,7 +162,19 @@ router.post('/signup/verify', async (req, res, next) => {
     clearOtpState(email);
     await ensureUserRow(data.user, { phone });
 
-    res.status(201).json({ user: data.user, session: data.session, message: 'Signed up successfully.' });
+    // Ensure we return a 100% active, valid session with the new password
+    // so the client immediately enters onboarding/dashboard without bouncing to login.
+    let activeSession = data.session;
+    try {
+      const { data: signInData, error: signInError } = await supabaseAnon.auth.signInWithPassword({ email, password });
+      if (!signInError && signInData?.session) {
+        activeSession = signInData.session;
+      }
+    } catch (e) {
+      console.warn('signup/verify: signInWithPassword fallback (non-fatal):', e.message);
+    }
+
+    res.status(201).json({ user: data.user, session: activeSession, message: 'Signed up successfully.' });
   } catch (err) { next(err); }
 });
 
@@ -276,18 +288,27 @@ router.post('/forgot-password/verify', async (req, res, next) => {
       return res.status(500).json({ error: 'Could not reset password. Please try again.' });
     }
 
-    // Revoke every other existing session for this account (other
-    // devices, a possibly-compromised session that triggered the reset in
-    // the first place) — only the session created just now by this OTP
-    // verify survives. Non-fatal if it errors; the password change itself
-    // already succeeded.
-    const { error: signOutError } = await supabaseAdmin.auth.admin.signOut(data.session.access_token, 'others');
-    if (signOutError) console.error('forgot-password/verify: signOut(others) failed (non-fatal):', signOutError.message);
+    // Ensure we return an active session with the new password
+    let activeSession = data.session;
+    try {
+      const { data: signInData, error: signInError } = await supabaseAnon.auth.signInWithPassword({ email, password: newPassword });
+      if (!signInError && signInData?.session) {
+        activeSession = signInData.session;
+      }
+    } catch (e) {
+      console.warn('forgot-password/verify: signInWithPassword fallback (non-fatal):', e.message);
+    }
+
+    // Revoke every other existing session for this account
+    if (activeSession?.access_token) {
+      const { error: signOutError } = await supabaseAdmin.auth.admin.signOut(activeSession.access_token, 'others');
+      if (signOutError) console.error('forgot-password/verify: signOut(others) failed (non-fatal):', signOutError.message);
+    }
 
     clearOtpState(email);
     clearFailedLogins(email);
 
-    res.json({ user: data.user, session: data.session, message: 'Password reset successfully.' });
+    res.json({ user: data.user, session: activeSession, message: 'Password reset successfully.' });
   } catch (err) { next(err); }
 });
 

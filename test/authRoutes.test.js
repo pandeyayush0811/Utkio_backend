@@ -86,6 +86,34 @@ test('signup/verify accepts valid OTP and password, sets password and ensures pr
   });
   assert.strictEqual(status, 201);
   assert.strictEqual(data.user.id, 'u1');
+  assert.strictEqual(data.session.access_token, 'tok');
+  mock.restoreAll();
+});
+
+test('signup/verify falls back to signInWithPassword to guarantee an active session if verifyOtp returns null session', async () => {
+  mock.method(supabaseAnon.auth, 'verifyOtp', async () => ({
+    data: { user: { id: 'u2', email: 'b@example.com' }, session: null },
+    error: null
+  }));
+  mock.method(supabaseAdmin.auth.admin, 'updateUserById', async () => ({ error: null }));
+  mock.method(supabaseAdmin, 'from', () => ({
+    upsert: async () => ({ error: null })
+  }));
+  mock.method(supabaseAnon.auth, 'signInWithPassword', async ({ email, password }) => {
+    assert.strictEqual(email, 'b@example.com');
+    assert.strictEqual(password, 'longenoughpassword');
+    return { data: { user: { id: 'u2', email }, session: { access_token: 'fresh-signin-tok' } }, error: null };
+  });
+
+  const app = buildApp();
+  const { status, data } = await post(app, '/auth/signup/verify', {
+    email: 'b@example.com',
+    phone: '9876543210',
+    token: '123456',
+    password: 'longenoughpassword'
+  });
+  assert.strictEqual(status, 201);
+  assert.strictEqual(data.session.access_token, 'fresh-signin-tok');
   mock.restoreAll();
 });
 
