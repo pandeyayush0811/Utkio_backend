@@ -520,15 +520,16 @@ router.get('/status', requireAuth, async (req, res, next) => {
     if (trialError) return next(trialError);
     const trial = Array.isArray(trialData) ? trialData[0] : trialData;
 
-    // `active` = "can the user actually use gated features right now"
-    // (unchanged field name/meaning for frontend backward-compat — was
-    // paid-only before, now also true during an in-progress free trial).
-    const active = hasPaidPlan || Boolean(trial && trial.trial_active);
+    const canChat = hasPaidPlan || Boolean(trial && trial.trial_active && trial.chats_remaining > 0);
+    const canReport = hasPaidPlan || Boolean(trial && trial.trial_active && trial.reports_remaining > 0);
+    const active = hasPaidPlan || Boolean(trial && trial.trial_active && (trial.chats_remaining > 0 || trial.reports_remaining > 0));
 
     res.json({
       plan: data.plan,
       plan_expires_at: data.plan_expires_at,
       active,
+      can_chat: canChat,
+      can_report: canReport,
       // Only meaningful right after a termination — the frontend shows a
       // one-time explanation banner (see settings.html) then this stays
       // in the response forever after (harmless; a stale historical
