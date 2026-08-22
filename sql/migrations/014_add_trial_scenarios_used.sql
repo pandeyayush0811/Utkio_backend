@@ -3,6 +3,11 @@
 
 alter table profiles add column if not exists trial_scenarios_used int not null default 0;
 
+-- Drop previous overloaded signatures to avoid "function is not unique" PostgREST RPC errors
+drop function if exists peek_access(uuid, int, int, int);
+drop function if exists peek_access(uuid, int, int, int, int);
+drop function if exists consume_access(uuid, text, int, int);
+
 create or replace function consume_access(
   p_user_id uuid,
   p_kind text,

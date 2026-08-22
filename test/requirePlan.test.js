@@ -122,3 +122,40 @@ test('rejects with 402 when RPC reports trial_not_started or user_not_found', as
   assert.strictEqual(res.body.reason, 'trial_not_started');
   mock.restoreAll();
 });
+
+test('requirePlan allows report generation when chats are exhausted (chats_used >= 5 but reports available)', async () => {
+  mock.method(supabaseAdmin, 'rpc', async (fn, args) => {
+    assert.strictEqual(fn, 'consume_access');
+    assert.strictEqual(args.p_kind, 'report');
+    return { data: [{ allowed: true, reason: 'trial_ok' }], error: null };
+  });
+
+  const req = { user: { id: 'user-8' } };
+  const res = mockRes();
+  let nextCalled = false;
+  await requirePlan('report')(req, res, () => { nextCalled = true; });
+
+  assert.strictEqual(nextCalled, true);
+  assert.strictEqual(req.accessReason, 'trial_ok');
+  assert.strictEqual(res.statusCode, null);
+  mock.restoreAll();
+});
+
+test('requirePlan allows scenario simulation when chats are exhausted (chats_used >= 5 but scenario available)', async () => {
+  mock.method(supabaseAdmin, 'rpc', async (fn, args) => {
+    assert.strictEqual(fn, 'consume_access');
+    assert.strictEqual(args.p_kind, 'scenario');
+    assert.strictEqual(args.p_trial_limit, 1);
+    return { data: [{ allowed: true, reason: 'trial_ok' }], error: null };
+  });
+
+  const req = { user: { id: 'user-9' } };
+  const res = mockRes();
+  let nextCalled = false;
+  await requirePlan('scenario')(req, res, () => { nextCalled = true; });
+
+  assert.strictEqual(nextCalled, true);
+  assert.strictEqual(req.accessReason, 'trial_ok');
+  assert.strictEqual(res.statusCode, null);
+  mock.restoreAll();
+});

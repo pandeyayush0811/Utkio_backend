@@ -511,20 +511,28 @@ router.get('/status', requireAuth, async (req, res, next) => {
     // Read-only trial peek (no side effects, safe to poll) — only meaningful
     // when there's no active paid plan, but we fetch it regardless so the
     // response shape is stable either way.
-    const { data: trialData, error: trialError } = await supabaseAdmin.rpc('peek_access', {
-      p_user_id: req.user.id,
-      p_trial_days: TRIAL_DAYS,
-      p_trial_limit_chats: TRIAL_CHAT_LIMIT,
-      p_trial_limit_reports: TRIAL_REPORT_LIMIT,
-      p_trial_limit_scenarios: TRIAL_SCENARIO_LIMIT
-    });
-    if (trialError) return next(trialError);
-    const trial = Array.isArray(trialData) ? trialData[0] : trialData;
+    let trial = null;
+    try {
+      const { data: trialData, error: trialError } = await supabaseAdmin.rpc('peek_access', {
+        p_user_id: req.user.id,
+        p_trial_days: TRIAL_DAYS,
+        p_trial_limit_chats: TRIAL_CHAT_LIMIT,
+        p_trial_limit_reports: TRIAL_REPORT_LIMIT,
+        p_trial_limit_scenarios: TRIAL_SCENARIO_LIMIT
+      });
+      if (trialError) {
+        console.warn('/payments/status: peek_access RPC error (fallback active):', trialError.message);
+      } else {
+        trial = Array.isArray(trialData) ? trialData[0] : trialData;
+      }
+    } catch (e) {
+      console.warn('/payments/status: peek_access threw (fallback active):', e.message);
+    }
 
-    const canChat = hasPaidPlan || Boolean(trial && trial.trial_active && trial.chats_remaining > 0);
-    const canReport = hasPaidPlan || Boolean(trial && trial.trial_active && trial.reports_remaining > 0);
-    const canScenario = hasPaidPlan || Boolean(trial && trial.trial_active && trial.scenarios_remaining > 0);
-    const active = hasPaidPlan || Boolean(trial && trial.trial_active && (trial.chats_remaining > 0 || trial.reports_remaining > 0 || trial.scenarios_remaining > 0));
+    const canChat = hasPaidPlan || Boolean(trial ? (trial.trial_active && trial.chats_remaining > 0) : true);
+    const canReport = hasPaidPlan || Boolean(trial ? (trial.trial_active && trial.reports_remaining > 0) : true);
+    const canScenario = hasPaidPlan || Boolean(trial ? (trial.trial_active && trial.scenarios_remaining > 0) : true);
+    const active = hasPaidPlan || Boolean(trial ? (trial.trial_active && (trial.chats_remaining > 0 || trial.reports_remaining > 0 || trial.scenarios_remaining > 0)) : true);
 
     res.json({
       plan: data.plan,
