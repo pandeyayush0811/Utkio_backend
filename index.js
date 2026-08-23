@@ -186,7 +186,7 @@ const http = require('http');
 const PORT = process.env.PORT || 3000;
 const server = http.createServer(app);
 
-server.listen(PORT, () => console.log(`Uktio backend listening on port ${PORT}`));
+server.listen(PORT, () => console.log(`Utkio backend listening on port ${PORT}`));
 
 // ═══════════════════════════════════════════════════════════════
 // OPTIONAL in-process payment reconciliation scheduler.

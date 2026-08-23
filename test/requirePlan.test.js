@@ -64,7 +64,7 @@ test('rejects with 402 + trial_expired message when the 3-day trial window has p
   assert.strictEqual(res.statusCode, 402);
   assert.strictEqual(res.body.error, 'active_plan_required');
   assert.strictEqual(res.body.reason, 'trial_expired');
-  assert.match(res.body.message, /trial khatam/);
+  assert.match(res.body.message, /trial has expired/i);
   mock.restoreAll();
 });
 
@@ -77,7 +77,7 @@ test('rejects with 402 + trial_limit_reached message once free credits are used 
 
   assert.strictEqual(res.statusCode, 402);
   assert.strictEqual(res.body.reason, 'trial_limit_reached');
-  assert.match(res.body.message, /free reports/);
+  assert.match(res.body.message, /free analysis reports/i);
   mock.restoreAll();
 });
 

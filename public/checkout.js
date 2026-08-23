@@ -35,7 +35,7 @@
     const planLabel = order.plan.charAt(0).toUpperCase() + order.plan.slice(1);
     cardEl.innerHTML =
       '<div class="logo">Utkio</div>' +
-      '<div class="plan-name">Uktio ' + esc(planLabel) + '</div>' +
+      '<div class="plan-name">Utkio ' + esc(planLabel) + '</div>' +
       '<div class="amount">\u20B9' + esc(rupees) + '</div>' +
       '<div class="sub">30 din ke liye</div>' +
       '<button id="payBtn">Pay \u20B9' + esc(rupees) + '</button>' +
@@ -64,8 +64,8 @@
       amount: order.amount,
       currency: order.currency,
       order_id: order.order_id,
-      name: 'Uktio',
-      description: 'Uktio ' + planLabel + ' \u2014 30 din',
+      name: 'Utkio',
+      description: 'Utkio ' + planLabel + ' \u2014 30 din',
       theme: { color: '#6a63f1' },
       handler: async function (response) {
         msg.textContent = 'Verifying payment...';

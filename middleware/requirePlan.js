@@ -44,17 +44,17 @@ function requirePlan(kind) {
 }
 
 function accessDeniedMessage(reason, kind) {
-  const what = kind === 'chat' ? 'practice session' : (kind === 'scenario' ? 'scenario simulation' : 'report');
+  const what = kind === 'chat' ? 'practice session' : (kind === 'scenario' ? 'scenario simulation' : 'analysis report');
   const limit = kind === 'chat' ? TRIAL_CHAT_LIMIT : (kind === 'scenario' ? TRIAL_SCENARIO_LIMIT : TRIAL_REPORT_LIMIT);
   switch (reason) {
     case 'trial_expired':
-      return 'Tumhara 3-din ka free trial khatam ho gaya hai — jaari rakhne ke liye plan lo.';
+      return 'Your 3-day free trial has expired. Please choose a plan to continue.';
     case 'trial_limit_reached':
-      return `Tumhare free trial ke ${limit} free ${what}${limit > 1 ? 's' : ''} use ho chuke hain — jaari rakhne ke liye plan lo.`;
+      return `You have used all ${limit} free ${what}${limit > 1 ? 's' : ''} in your trial. Please choose a plan to continue.`;
     case 'trial_not_started':
     case 'user_not_found':
     default:
-      return 'Practice sessions ke liye ek active plan ya free trial chahiye.';
+      return 'An active plan or trial is required to start practice sessions.';
   }
 }
 
