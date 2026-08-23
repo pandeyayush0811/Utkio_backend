@@ -95,3 +95,6 @@ test/                          Unit tests (node:test, no DB/network needed)
   If you deploy a second instance, set `REDIS_URL` (see
   `.env.example`) so both instances share the same counters — otherwise
   an attacker effectively gets `max × instance count` requests through.
+
+
+everything is good at this level - GOAT 1.1.1
