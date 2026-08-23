@@ -141,3 +141,59 @@ test('reconcilePendingPayments: does not mark uncaptured order younger than 30 m
   assert.strictEqual(updateCalled, false); // Not marked failed yet
   mock.restoreAll();
 });
+
+const { activatePlan } = require('../lib/planActivation');
+
+test('activatePlan: resets commit_mode_terminated_at and reason when activating commit_mode', async () => {
+  let profileUpdatePayload = null;
+
+  mock.method(supabaseAdmin, 'from', (table) => {
+    if (table === 'payments') {
+      return {
+        update: (payload) => ({
+          eq: () => ({
+            eq: () => ({
+              select: () => ({
+                maybeSingle: async () => ({
+                  data: { id: 'pay-001', user_id: 'user-001', plan: 'commit_mode', amount_paise: 12100 },
+                  error: null
+                })
+              })
+            })
+          })
+        })
+      };
+    }
+    if (table === 'profiles') {
+      return {
+        select: () => ({
+          eq: () => ({
+            single: async () => ({
+              data: { plan: 'commit_mode', plan_expires_at: null },
+              error: null
+            })
+          })
+        }),
+        update: (payload) => {
+          profileUpdatePayload = payload;
+          return {
+            eq: async () => ({ error: null })
+          };
+        }
+      };
+    }
+    throw new Error('Unexpected table: ' + table);
+  });
+
+  const res = await activatePlan({
+    payment: { id: 'pay-001' },
+    razorpay_payment_id: 'pay_rzp_123'
+  });
+
+  assert.strictEqual(res.activated, true);
+  assert.strictEqual(res.plan, 'commit_mode');
+  assert.strictEqual(profileUpdatePayload.commit_mode_terminated_at, null);
+  assert.strictEqual(profileUpdatePayload.commit_mode_termination_reason, null);
+  assert.strictEqual(profileUpdatePayload.plan, 'commit_mode');
+  mock.restoreAll();
+});
