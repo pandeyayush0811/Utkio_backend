@@ -13,10 +13,22 @@ const DEFAULT_ANNOUNCEMENTS = [
   }
 ];
 
+let cachedAnnouncements = null;
+let cacheExpiresAt = 0;
+const ANNOUNCEMENTS_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 // GET /announcements — returns active system announcements.
-// Fail-safe and lightweight: never throws or crashes if database is slow.
+// Fail-safe, cached, and lightweight: never throws or crashes if database is slow.
 router.get('/', async (req, res, next) => {
   try {
+    res.set('Cache-Control', 'public, max-age=300, stale-while-revalidate=600');
+
+    if (cachedAnnouncements && Date.now() < cacheExpiresAt) {
+      return res.json({ announcements: cachedAnnouncements });
+    }
+
+    let announcements = DEFAULT_ANNOUNCEMENTS;
+
     if (supabaseAdmin) {
       const { data: configRow } = await supabaseAdmin
         .from('prompt_configs')
@@ -28,29 +40,28 @@ router.get('/', async (req, res, next) => {
         try {
           const parsed = JSON.parse(configRow.prompt);
           if (Array.isArray(parsed) && parsed.length > 0) {
-            return res.json({ announcements: parsed });
-          }
-          if (parsed && typeof parsed === 'object' && parsed.id) {
-            return res.json({ announcements: [parsed] });
+            announcements = parsed;
+          } else if (parsed && typeof parsed === 'object' && parsed.id) {
+            announcements = [parsed];
           }
         } catch {
           // If prompt is plain text instead of JSON, wrap as a single announcement
-          return res.json({
-            announcements: [
-              {
-                id: 'custom-announcement',
-                badge: 'Notice',
-                title: 'Announcement',
-                desc: configRow.prompt,
-                link: null
-              }
-            ]
-          });
+          announcements = [
+            {
+              id: 'custom-announcement',
+              badge: 'Notice',
+              title: 'Announcement',
+              desc: configRow.prompt,
+              link: null
+            }
+          ];
         }
       }
     }
 
-    res.json({ announcements: DEFAULT_ANNOUNCEMENTS });
+    cachedAnnouncements = announcements;
+    cacheExpiresAt = Date.now() + ANNOUNCEMENTS_CACHE_TTL_MS;
+    res.json({ announcements });
   } catch (err) { next(err); }
 });
 

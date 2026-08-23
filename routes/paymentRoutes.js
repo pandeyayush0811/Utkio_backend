@@ -20,6 +20,9 @@ const {
   consumeConsent
 } = require('../lib/commitMode');
 
+// Shared dedup window across /create-order and /checkout/init (5 minutes)
+const DEDUP_WINDOW_MS = 5 * 60 * 1000;
+
 // Shared by /create-order and /checkout/init below — a commit_mode
 // purchase attempt is blocked (402, not 400: this is an access/consent
 // problem, not a malformed request) unless a fresh, unconsumed consent
@@ -295,14 +298,6 @@ router.post('/webhook', async (req, res, next) => {
 // ═══════════════════════════════════════════════════════════════
 
 const CHECKOUT_TOKEN_TTL_MS = 15 * 60 * 1000; // 15 minutes — plenty for a checkout, short enough to limit exposure if a URL leaks (e.g. shared-clipboard, chat screenshot)
-
-// How long a still-'created' payment for the same user+plan is treated
-// as "the same purchase attempt" for dedup purposes (see /create-order
-// and /checkout/init above). Long enough to absorb a slow retry/double
-// tap, short enough that someone who genuinely abandons checkout and
-// comes back later still gets a fresh order rather than being stuck
-// reusing a stale one.
-const DEDUP_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 
 router.post('/checkout/init', requireAuth, async (req, res, next) => {
   try {
