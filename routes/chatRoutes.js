@@ -364,6 +364,31 @@ async function getAnalysisPrompt() {
   return data.prompt;
 }
 
+// Compensating transaction: refunds 1 trial report credit if the user is on the
+// free plan and their trial_reports_used counter was incremented before an
+// unrecoverable upstream AI failure (e.g. OpenAI 502/rate-limit/empty response).
+async function refundTrialReportCredit(userId) {
+  try {
+    if (!supabaseAdmin || !userId) return;
+    const { data: prof, error: profErr } = await supabaseAdmin
+      .from('profiles')
+      .select('plan, trial_reports_used')
+      .eq('id', userId)
+      .single();
+
+    if (!profErr && prof && prof.plan === 'free' && (prof.trial_reports_used || 0) > 0) {
+      const newCount = Math.max(0, (prof.trial_reports_used || 1) - 1);
+      await supabaseAdmin
+        .from('profiles')
+        .update({ trial_reports_used: newCount })
+        .eq('id', userId);
+      console.info(`[refundTrialReportCredit] Refunded 1 trial report credit for user ${userId} (new used: ${newCount})`);
+    }
+  } catch (err) {
+    console.error('[refundTrialReportCredit] Failed to refund trial report credit for user', userId, err);
+  }
+}
+
 // Columns for the new report shape — kept in one place so the idempotent
 // fast-path and the GET route can't drift apart.
 const REPORT_COLUMNS = 'id, session_id, report_text, model_version, generated_at';
@@ -546,6 +571,7 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
           rawText = response.choices[0].message.content;
         } catch (aiErr) {
           console.error('Analysis LLM call failed:', aiErr);
+          await refundTrialReportCredit(req.user.id);
           return res.status(502).json({ error: 'Analysis failed — please try again.' });
         }
 
@@ -559,6 +585,7 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
 
         if (!safeReport.report_text) {
           console.error('Analysis LLM returned empty content for session', sessionId);
+          await refundTrialReportCredit(req.user.id);
           return res.status(502).json({ error: 'Analysis failed — please try again.' });
         }
 
@@ -571,7 +598,10 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
           .select(REPORT_COLUMNS)
           .single();
 
-        if (saveErr) return next(saveErr);
+        if (saveErr) {
+          await refundTrialReportCredit(req.user.id);
+          return next(saveErr);
+        }
         reportSaved = true;
         res.json({ report: saved, already_existed: false });
       } catch (err) { next(err); }
@@ -582,3 +612,4 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
 module.exports = router;
 module.exports.validateMessages = validateMessages; // exported for tests only
 module.exports.validateSessionType = validateSessionType; // exported for tests only
+module.exports.refundTrialReportCredit = refundTrialReportCredit; // exported for tests only

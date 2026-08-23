@@ -159,3 +159,53 @@ test('requirePlan allows scenario simulation when chats are exhausted (chats_use
   assert.strictEqual(res.statusCode, null);
   mock.restoreAll();
 });
+
+const { refundTrialReportCredit } = require('../routes/chatRoutes');
+
+test('refundTrialReportCredit: decrements trial_reports_used for free tier users on AI failure', async () => {
+  let updatedPayload = null;
+
+  mock.method(supabaseAdmin, 'from', (table) => {
+    assert.strictEqual(table, 'profiles');
+    return {
+      select: () => ({
+        eq: () => ({
+          single: async () => ({ data: { plan: 'free', trial_reports_used: 1 }, error: null })
+        })
+      }),
+      update: (payload) => {
+        updatedPayload = payload;
+        return {
+          eq: async () => ({ error: null })
+        };
+      }
+    };
+  });
+
+  await refundTrialReportCredit('user-test-free');
+  assert.deepStrictEqual(updatedPayload, { trial_reports_used: 0 });
+  mock.restoreAll();
+});
+
+test('refundTrialReportCredit: does not modify paid plan profiles', async () => {
+  let updateCalled = false;
+
+  mock.method(supabaseAdmin, 'from', (table) => {
+    assert.strictEqual(table, 'profiles');
+    return {
+      select: () => ({
+        eq: () => ({
+          single: async () => ({ data: { plan: 'starter', trial_reports_used: 0 }, error: null })
+        })
+      }),
+      update: () => {
+        updateCalled = true;
+        return { eq: async () => ({ error: null }) };
+      }
+    };
+  });
+
+  await refundTrialReportCredit('user-test-paid');
+  assert.strictEqual(updateCalled, false);
+  mock.restoreAll();
+});
