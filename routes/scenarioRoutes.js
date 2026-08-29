@@ -36,6 +36,7 @@ router.get('/today', requireAuth, async (req, res, next) => {
       .select('id, scenario_key, started_at')
       .eq('user_id', req.user.id)
       .eq('session_type', 'scenario')
+      .gt('turn_count', 0)
       .order('started_at', { ascending: false })
       .limit(1)
       .maybeSingle();

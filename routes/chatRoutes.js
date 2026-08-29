@@ -11,6 +11,7 @@ const OpenAI = require('openai');
 const SESSION_TYPES = new Set(['freeform', 'scenario']);
 
 const MIN_TURNS_FOR_ANALYSIS = 10; // matches the frontend's button-enable threshold
+const MIN_SCENARIO_TURNS_FOR_ANALYSIS = 2; // Scenario roleplay threshold (allows 3-minute simulations with >= 1 interactive exchange)
 
 const MAX_MESSAGES_PER_SESSION = 500; // sanity cap — a normal session is a few dozen turns
 
@@ -187,6 +188,7 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
             .select('id')
             .eq('user_id', req.user.id)
             .eq('session_type', 'scenario')
+            .gt('turn_count', 0)
             .gte('started_at', todayStart)
             .limit(1)
             .maybeSingle();
@@ -484,14 +486,18 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
     // few turns) shouldn't cost the user a trial credit either.
     const { data: session, error: sessionErr } = await supabaseAdmin
       .from('chat_sessions')
-      .select('id, turn_count')
+      .select('id, turn_count, session_type')
       .eq('id', sessionId)
       .eq('user_id', req.user.id)
       .single();
     if (sessionErr || !session) return res.status(404).json({ error: 'Session not found' });
 
-    if (session.turn_count < MIN_TURNS_FOR_ANALYSIS) {
-      return res.status(400).json({ error: `Session needs at least ${MIN_TURNS_FOR_ANALYSIS} turns to analyze (has ${session.turn_count}).` });
+    const minRequiredTurns = session.session_type === 'scenario'
+      ? MIN_SCENARIO_TURNS_FOR_ANALYSIS
+      : MIN_TURNS_FOR_ANALYSIS;
+
+    if (session.turn_count < minRequiredTurns) {
+      return res.status(400).json({ error: `Session needs at least ${minRequiredTurns} turns to analyze (has ${session.turn_count}).` });
     }
 
     // ---- Atomic claim (see comment above the route for the full why) ----
@@ -613,3 +619,5 @@ module.exports = router;
 module.exports.validateMessages = validateMessages; // exported for tests only
 module.exports.validateSessionType = validateSessionType; // exported for tests only
 module.exports.refundTrialReportCredit = refundTrialReportCredit; // exported for tests only
+module.exports.MIN_TURNS_FOR_ANALYSIS = MIN_TURNS_FOR_ANALYSIS; // exported for tests only
+module.exports.MIN_SCENARIO_TURNS_FOR_ANALYSIS = MIN_SCENARIO_TURNS_FOR_ANALYSIS; // exported for tests only
