@@ -1,11 +1,12 @@
-const test = require('node:test');
+const { test, mock } = require('node:test');
 const assert = require('node:assert');
 
 process.env.SUPABASE_URL = process.env.SUPABASE_URL || 'https://dummy.supabase.co';
 process.env.SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || 'dummy-anon-key';
 process.env.SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'dummy-service-role-key';
 
-const { calculateStreak, istDateString, shiftIstDate } = require('../lib/streak');
+const { calculateStreak, getUserStreak, istDateString, shiftIstDate } = require('../lib/streak');
+const { supabaseAdmin } = require('../lib/supabaseClient');
 
 test('streak: returns 0 for empty or invalid timestamps', () => {
   const res1 = calculateStreak([]);
@@ -131,3 +132,52 @@ test('streak: correctly converts near-midnight UTC to IST date', () => {
   const dateUtkBeforeMidnight = new Date('2026-08-21T18:29:00.000Z');
   assert.strictEqual(istDateString(dateUtkBeforeMidnight), '2026-08-21');
 });
+
+test('getUserStreak applies order started_at desc and bounds query limit (AUD-006)', async () => {
+  let orderCalledWith = null;
+  let limitCalledWith = null;
+
+  mock.method(supabaseAdmin, 'from', (table) => {
+    assert.strictEqual(table, 'chat_sessions');
+    return {
+      select: (fields) => {
+        assert.strictEqual(fields, 'started_at');
+        return {
+          eq: (field, val) => {
+            assert.strictEqual(field, 'user_id');
+            assert.strictEqual(val, 'user-123');
+            return {
+              gt: (field2, val2) => {
+                assert.strictEqual(field2, 'turn_count');
+                assert.strictEqual(val2, 0);
+                return {
+                  order: (orderCol, orderOpts) => {
+                    orderCalledWith = { orderCol, orderOpts };
+                    return {
+                      limit: (limitCount) => {
+                        limitCalledWith = limitCount;
+                        return Promise.resolve({
+                          data: [{ started_at: '2026-08-21T06:00:00.000Z' }],
+                          error: null
+                        });
+                      }
+                    };
+                  }
+                };
+              }
+            };
+          }
+        };
+      }
+    };
+  });
+
+  const res = await getUserStreak('user-123', new Date('2026-08-21T14:00:00.000Z'));
+  assert.deepStrictEqual(orderCalledWith, { orderCol: 'started_at', orderOpts: { ascending: false } });
+  assert.strictEqual(limitCalledWith, 1000);
+  assert.strictEqual(res.current_streak, 1);
+  assert.strictEqual(res.best_streak, 1);
+
+  mock.restoreAll();
+});
+

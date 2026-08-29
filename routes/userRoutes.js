@@ -56,23 +56,51 @@ function buildProfileUpdate(body, { partial }) {
     if (!occupation_type || !VALID_OCCUPATIONS.includes(occupation_type)) {
       return { error: `occupation_type must be one of: ${VALID_OCCUPATIONS.join(', ')}` };
     }
-    if (occupation_type === 'student' && (!class_grade || !String(class_grade).trim())) {
-      return { error: 'class_grade is required when occupation_type is student' };
+    if (occupation_type === 'student') {
+      if (!class_grade || !String(class_grade).trim()) {
+        return { error: 'class_grade is required when occupation_type is student' };
+      }
+      const trimmedClassGrade = String(class_grade).trim();
+      if (trimmedClassGrade.length > MAX_OCCUPATION_DETAIL_LEN) {
+        return { error: `class_grade must be at most ${MAX_OCCUPATION_DETAIL_LEN} characters` };
+      }
+      update.occupation_type = 'student';
+      update.class_grade = trimmedClassGrade;
+      update.profession = null;
+    } else if (occupation_type === 'professional') {
+      if (!profession || !String(profession).trim()) {
+        return { error: 'profession is required when occupation_type is professional' };
+      }
+      const trimmedProfession = String(profession).trim();
+      if (trimmedProfession.length > MAX_OCCUPATION_DETAIL_LEN) {
+        return { error: `profession must be at most ${MAX_OCCUPATION_DETAIL_LEN} characters` };
+      }
+      update.occupation_type = 'professional';
+      update.profession = trimmedProfession;
+      update.class_grade = null;
     }
-    if (occupation_type === 'professional' && (!profession || !String(profession).trim())) {
-      return { error: 'profession is required when occupation_type is professional' };
+  } else {
+    // Partial update without occupation_type: validate and set whichever sub-fields are present
+    if (has(class_grade)) {
+      if (!class_grade || !String(class_grade).trim()) {
+        return { error: 'class_grade is required' };
+      }
+      const trimmedClassGrade = String(class_grade).trim();
+      if (trimmedClassGrade.length > MAX_OCCUPATION_DETAIL_LEN) {
+        return { error: `class_grade must be at most ${MAX_OCCUPATION_DETAIL_LEN} characters` };
+      }
+      update.class_grade = trimmedClassGrade;
     }
-    const trimmedClassGrade = occupation_type === 'student' ? String(class_grade).trim() : null;
-    const trimmedProfession = occupation_type === 'professional' ? String(profession).trim() : null;
-    if (trimmedClassGrade && trimmedClassGrade.length > MAX_OCCUPATION_DETAIL_LEN) {
-      return { error: `class_grade must be at most ${MAX_OCCUPATION_DETAIL_LEN} characters` };
+    if (has(profession)) {
+      if (!profession || !String(profession).trim()) {
+        return { error: 'profession is required' };
+      }
+      const trimmedProfession = String(profession).trim();
+      if (trimmedProfession.length > MAX_OCCUPATION_DETAIL_LEN) {
+        return { error: `profession must be at most ${MAX_OCCUPATION_DETAIL_LEN} characters` };
+      }
+      update.profession = trimmedProfession;
     }
-    if (trimmedProfession && trimmedProfession.length > MAX_OCCUPATION_DETAIL_LEN) {
-      return { error: `profession must be at most ${MAX_OCCUPATION_DETAIL_LEN} characters` };
-    }
-    update.occupation_type = occupation_type;
-    update.class_grade = trimmedClassGrade;
-    update.profession = trimmedProfession;
   }
 
   // city (always optional)

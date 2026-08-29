@@ -162,7 +162,7 @@ test('requirePlan allows scenario simulation when chats are exhausted (chats_use
 
 const { refundTrialReportCredit } = require('../routes/chatRoutes');
 
-test('refundTrialReportCredit: decrements trial_reports_used for free tier users on AI failure', async () => {
+test('refundTrialReportCredit: decrements trial_reports_used for plan = none users on AI failure', async () => {
   let updatedPayload = null;
 
   mock.method(supabaseAdmin, 'from', (table) => {
@@ -170,7 +170,7 @@ test('refundTrialReportCredit: decrements trial_reports_used for free tier users
     return {
       select: () => ({
         eq: () => ({
-          single: async () => ({ data: { plan: 'free', trial_reports_used: 1 }, error: null })
+          single: async () => ({ data: { plan: 'none', trial_reports_used: 1 }, error: null })
         })
       }),
       update: (payload) => {
@@ -182,8 +182,56 @@ test('refundTrialReportCredit: decrements trial_reports_used for free tier users
     };
   });
 
-  await refundTrialReportCredit('user-test-free');
+  await refundTrialReportCredit('user-test-none');
   assert.deepStrictEqual(updatedPayload, { trial_reports_used: 0 });
+  mock.restoreAll();
+});
+
+test('refundTrialReportCredit: decrements trial_reports_used when plan is null', async () => {
+  let updatedPayload = null;
+
+  mock.method(supabaseAdmin, 'from', (table) => {
+    assert.strictEqual(table, 'profiles');
+    return {
+      select: () => ({
+        eq: () => ({
+          single: async () => ({ data: { plan: null, trial_reports_used: 2 }, error: null })
+        })
+      }),
+      update: (payload) => {
+        updatedPayload = payload;
+        return {
+          eq: async () => ({ error: null })
+        };
+      }
+    };
+  });
+
+  await refundTrialReportCredit('user-test-null-plan');
+  assert.deepStrictEqual(updatedPayload, { trial_reports_used: 1 });
+  mock.restoreAll();
+});
+
+test('refundTrialReportCredit: does not modify when trial_reports_used is 0', async () => {
+  let updateCalled = false;
+
+  mock.method(supabaseAdmin, 'from', (table) => {
+    assert.strictEqual(table, 'profiles');
+    return {
+      select: () => ({
+        eq: () => ({
+          single: async () => ({ data: { plan: 'none', trial_reports_used: 0 }, error: null })
+        })
+      }),
+      update: () => {
+        updateCalled = true;
+        return { eq: async () => ({ error: null }) };
+      }
+    };
+  });
+
+  await refundTrialReportCredit('user-test-zero');
+  assert.strictEqual(updateCalled, false);
   mock.restoreAll();
 });
 

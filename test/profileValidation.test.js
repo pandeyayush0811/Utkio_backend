@@ -73,3 +73,25 @@ test('partial update: still validates a field if it IS sent, even badly', () => 
   const { error } = buildProfileUpdate({ age: -5 }, { partial: true });
   assert.match(error, /age must be/);
 });
+
+test('partial update: allows updating class_grade without occupation_type (AUD-007)', () => {
+  const { updateObj, error } = buildProfileUpdate({ class_grade: 'MCA 1st year' }, { partial: true });
+  assert.strictEqual(error, undefined);
+  assert.deepStrictEqual(updateObj, { class_grade: 'MCA 1st year' });
+});
+
+test('partial update: allows updating profession without occupation_type (AUD-007)', () => {
+  const { updateObj, error } = buildProfileUpdate({ profession: 'Software Engineer' }, { partial: true });
+  assert.strictEqual(error, undefined);
+  assert.deepStrictEqual(updateObj, { profession: 'Software Engineer' });
+});
+
+test('partial update: rejects standalone class_grade or profession exceeding MAX_OCCUPATION_DETAIL_LEN (AUD-007)', () => {
+  const longStr = 'a'.repeat(151);
+  const res1 = buildProfileUpdate({ class_grade: longStr }, { partial: true });
+  assert.match(res1.error, /class_grade must be at most 150 characters/);
+
+  const res2 = buildProfileUpdate({ profession: longStr }, { partial: true });
+  assert.match(res2.error, /profession must be at most 150 characters/);
+});
+

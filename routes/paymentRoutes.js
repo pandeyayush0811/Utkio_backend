@@ -524,10 +524,12 @@ router.get('/status', requireAuth, async (req, res, next) => {
       console.warn('/payments/status: peek_access threw (fallback active):', e.message);
     }
 
-    const canChat = hasPaidPlan || Boolean(trial ? (trial.trial_active && trial.chats_remaining > 0) : true);
-    const canReport = hasPaidPlan || Boolean(trial ? (trial.trial_active && trial.reports_remaining > 0) : true);
-    const canScenario = hasPaidPlan || Boolean(trial ? (trial.trial_active && trial.scenarios_remaining > 0) : true);
-    const active = hasPaidPlan || Boolean(trial ? (trial.trial_active && (trial.chats_remaining > 0 || trial.reports_remaining > 0 || trial.scenarios_remaining > 0)) : true);
+    const canChat = hasPaidPlan || Boolean(trial && trial.trial_active && trial.chats_remaining > 0);
+    const canReport = hasPaidPlan || Boolean(trial && trial.trial_active && trial.reports_remaining > 0);
+    const canScenario = hasPaidPlan || Boolean(trial && trial.trial_active && trial.scenarios_remaining > 0);
+    const active = hasPaidPlan || Boolean(trial && trial.trial_active && (
+      trial.chats_remaining > 0 || trial.reports_remaining > 0 || trial.scenarios_remaining > 0
+    ));
 
     res.json({
       plan: data.plan,

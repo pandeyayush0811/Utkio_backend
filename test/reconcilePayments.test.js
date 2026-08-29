@@ -197,3 +197,107 @@ test('activatePlan: resets commit_mode_terminated_at and reason when activating 
   assert.strictEqual(profileUpdatePayload.plan, 'commit_mode');
   mock.restoreAll();
 });
+
+test('reconcilePendingPayments: concurrent executions skip duplicate runs without duplicate Razorpay fetches', async () => {
+  const oldDate = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+  const candidate = {
+    id: 'pay-conc-unit-001',
+    user_id: 'user-conc-unit-001',
+    plan: 'starter',
+    amount_paise: 9900,
+    razorpay_order_id: 'order_conc_unit_001',
+    status: 'created',
+    created_at: oldDate
+  };
+
+  let fetchPaymentsCallCount = 0;
+  mock.method(supabaseAdmin, 'from', () => ({
+    select: () => ({
+      eq: () => ({
+        lte: () => ({
+          gte: () => ({
+            order: () => ({
+              limit: () => Promise.resolve({ data: [candidate], error: null })
+            })
+          })
+        })
+      })
+    }),
+    update: () => ({
+      eq: () => ({
+        eq: () => Promise.resolve({ error: null })
+      })
+    })
+  }));
+
+  mock.method(razorpay.orders, 'fetchPayments', async () => {
+    fetchPaymentsCallCount += 1;
+    await new Promise((r) => setTimeout(r, 50));
+    return { items: [] };
+  });
+
+  const [res1, res2] = await Promise.all([
+    reconcilePendingPayments(),
+    reconcilePendingPayments()
+  ]);
+
+  const executed = [res1, res2].find((r) => !r.skipped);
+  const skipped = [res1, res2].find((r) => r.skipped === true);
+
+  assert.ok(executed, 'One execution must succeed');
+  assert.ok(skipped, 'Second execution must be skipped due to lock');
+  assert.strictEqual(skipped.skipped, true);
+  assert.strictEqual(skipped.reason, 'locked');
+  assert.strictEqual(fetchPaymentsCallCount, 1, 'Only one fetch should occur');
+
+  mock.restoreAll();
+});
+
+test('reconcilePendingPayments: bypassLock option allows execution without lock obstruction', async () => {
+  const oldDate = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+  const candidate = {
+    id: 'pay-bypass-unit-001',
+    user_id: 'user-bypass-unit-001',
+    plan: 'starter',
+    amount_paise: 9900,
+    razorpay_order_id: 'order_bypass_unit_001',
+    status: 'created',
+    created_at: oldDate
+  };
+
+  mock.method(supabaseAdmin, 'from', () => ({
+    select: () => ({
+      eq: () => ({
+        lte: () => ({
+          gte: () => ({
+            order: () => ({
+              limit: () => Promise.resolve({ data: [candidate], error: null })
+            })
+          })
+        })
+      })
+    }),
+    update: () => ({
+      eq: () => ({
+        eq: () => Promise.resolve({ error: null })
+      })
+    })
+  }));
+
+  mock.method(razorpay.orders, 'fetchPayments', async () => {
+    await new Promise((r) => setTimeout(r, 50));
+    return { items: [] };
+  });
+
+  // Start background sweep
+  const bgPromise = reconcilePendingPayments();
+  const bypassRes = await reconcilePendingPayments({ bypassLock: true });
+
+  await bgPromise;
+
+  assert.strictEqual(bypassRes.skipped, undefined);
+  assert.strictEqual(bypassRes.checked, 1);
+
+  mock.restoreAll();
+});
+

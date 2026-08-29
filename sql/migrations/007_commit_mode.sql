@@ -186,4 +186,5 @@ begin
     end
   where commit_mode_daily_progress.judged_at is null; -- no-op if already judged, per above
 end;
-$$ language plpgsql security definer;
+$$ language plpgsql security definer set search_path = public;
+

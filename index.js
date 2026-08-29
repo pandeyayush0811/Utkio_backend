@@ -213,6 +213,9 @@ if (RECONCILE_INTERVAL_MINUTES > 0) {
   const runReconciliation = async () => {
     try {
       const summary = await reconcilePendingPayments();
+      if (summary.skipped) {
+        return;
+      }
       if (summary.activated > 0 || summary.errors.length > 0) {
         console.log('[reconcile] scheduled run:', summary);
       }

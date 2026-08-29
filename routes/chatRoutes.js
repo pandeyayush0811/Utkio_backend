@@ -376,7 +376,7 @@ async function refundTrialReportCredit(userId) {
       .eq('id', userId)
       .single();
 
-    if (!profErr && prof && prof.plan === 'free' && (prof.trial_reports_used || 0) > 0) {
+    if (!profErr && prof && (!prof.plan || prof.plan === 'none') && (prof.trial_reports_used || 0) > 0) {
       const newCount = Math.max(0, (prof.trial_reports_used || 1) - 1);
       await supabaseAdmin
         .from('profiles')
