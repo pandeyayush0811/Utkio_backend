@@ -366,3 +366,181 @@ test('AUD-005 TIMEZONE: session crossing IST midnight is attributed deterministi
   const nextDayStartUtc = new Date('2026-08-28T18:31:00.000Z'); // 00:01 IST on 2026-08-29
   assert.strictEqual(istDateString(nextDayStartUtc), '2026-08-29', 'Session starting after midnight IST must be assigned to next IST day');
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SUITE 6: Scenario Session Progress Recording (AUD-020)
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('AUD-020: POST /chat/sessions records Commit Mode scenario progress for brand-new scenario session', async () => {
+  let capturedRpc = null;
+  mock.method(supabaseAdmin, 'rpc', async (fnName, params) => {
+    if (fnName === 'consume_access') {
+      return { data: { allowed: true, plan: 'commit_mode' }, error: null };
+    }
+    if (fnName === 'record_commit_mode_progress') {
+      capturedRpc = { fnName, params };
+      return { data: null, error: null };
+    }
+    return { data: null, error: null };
+  });
+
+  mock.method(supabaseAnon.auth, 'getUser', async () => ({
+    data: { user: { id: 'user-scen-01', email: 'scen@example.in' } },
+    error: null
+  }));
+
+  mock.method(supabaseAdmin, 'from', (table) => {
+    if (table === 'profiles') {
+      return {
+        select: () => ({
+          eq: () => ({
+            single: async () => ({
+              data: { plan: 'commit_mode', plan_expires_at: new Date(Date.now() + 86400000).toISOString() },
+              error: null
+            })
+          })
+        })
+      };
+    }
+    if (table === 'chat_sessions') {
+      const builder = {
+        select: (cols) => {
+          if (cols === 'id') {
+            return builder;
+          }
+          return {
+            single: async () => ({
+              data: { id: 'session-scen-new-1', user_id: 'user-scen-01', session_type: 'scenario', turn_count: 2 },
+              error: null
+            })
+          };
+        },
+        eq: () => builder,
+        gt: () => builder,
+        gte: () => builder,
+        limit: () => builder,
+        maybeSingle: async () => ({ data: null, error: null }),
+        insert: (row) => ({
+          select: () => ({
+            single: async () => ({
+              data: { id: 'session-scen-new-1', user_id: 'user-scen-01', ...row },
+              error: null
+            })
+          })
+        })
+      };
+      return builder;
+    }
+    if (table === 'chat_messages') {
+      return {
+        upsert: async () => ({ error: null }),
+        insert: async () => ({ error: null })
+      };
+    }
+    return { select: () => ({ eq: () => ({ single: async () => ({ data: {}, error: null }) }) }) };
+  });
+
+  const app = buildApp();
+  const startedAt = '2026-08-29T10:00:00.000Z';
+  const endedAt = '2026-08-29T10:04:00.000Z';
+  const { status, data } = await request(app, 'POST', '/chat/sessions', {
+    started_at: startedAt,
+    ended_at: endedAt,
+    session_type: 'scenario',
+    scenario_key: 'restaurant_order',
+    messages: [
+      { role: 'user', content: 'Table for two please', turn_index: 0 },
+      { role: 'assistant', content: 'Right this way!', turn_index: 1 }
+    ]
+  }, {
+    Authorization: 'Bearer valid-token-commit'
+  });
+
+  assert.strictEqual(status, 200);
+  assert.strictEqual(data.session_id, 'session-scen-new-1');
+  assert.notStrictEqual(capturedRpc, null, 'record_commit_mode_progress RPC MUST be invoked for scenario sessions');
+  assert.strictEqual(capturedRpc.params.p_kind, 'scenario');
+  assert.strictEqual(capturedRpc.params.p_seconds, 0);
+  assert.strictEqual(capturedRpc.params.p_ist_date, istDateString(new Date(endedAt)));
+
+  mock.restoreAll();
+});
+
+test('AUD-020: POST /chat/sessions records Commit Mode scenario progress for resumed scenario session', async () => {
+  let capturedRpc = null;
+  mock.method(supabaseAdmin, 'rpc', async (fnName, params) => {
+    if (fnName === 'record_commit_mode_progress') {
+      capturedRpc = { fnName, params };
+      return { data: null, error: null };
+    }
+    return { data: null, error: null };
+  });
+
+  mock.method(supabaseAnon.auth, 'getUser', async () => ({
+    data: { user: { id: 'user-scen-02', email: 'scen2@example.in' } },
+    error: null
+  }));
+
+  mock.method(supabaseAdmin, 'from', (table) => {
+    if (table === 'chat_sessions') {
+      return {
+        select: () => ({
+          eq: () => ({
+            eq: () => ({
+              single: async () => ({
+                data: { id: 'session-scen-resumed-1', user_id: 'user-scen-02', session_type: 'scenario', turn_count: 2, scenario_key: 'restaurant_order' },
+                error: null
+              })
+            })
+          })
+        }),
+        update: () => ({
+          eq: async () => ({ error: null })
+        })
+      };
+    }
+    if (table === 'session_reports') {
+      return {
+        select: () => ({
+          eq: () => ({
+            eq: () => ({
+              maybeSingle: async () => ({ data: null, error: null })
+            })
+          })
+        })
+      };
+    }
+    if (table === 'chat_messages') {
+      return {
+        upsert: async () => ({ error: null })
+      };
+    }
+    return { select: () => ({ eq: () => ({ single: async () => ({ data: {}, error: null }) }) }) };
+  });
+
+  const app = buildApp();
+  const startedAt = '2026-08-29T10:02:00.000Z';
+  const endedAt = '2026-08-29T10:05:00.000Z';
+  const { status, data } = await request(app, 'POST', '/chat/sessions', {
+    session_id: 'session-scen-resumed-1',
+    session_type: 'scenario',
+    scenario_key: 'restaurant_order',
+    started_at: startedAt,
+    ended_at: endedAt,
+    messages: [
+      { role: 'user', content: 'Can we see the menu?', turn_index: 2 },
+      { role: 'assistant', content: 'Here you go!', turn_index: 3 }
+    ]
+  }, {
+    Authorization: 'Bearer valid-token-commit'
+  });
+
+  assert.strictEqual(status, 200);
+  assert.strictEqual(data.session_id, 'session-scen-resumed-1');
+  assert.notStrictEqual(capturedRpc, null, 'record_commit_mode_progress RPC MUST be invoked for resumed scenario sessions');
+  assert.strictEqual(capturedRpc.params.p_kind, 'scenario');
+  assert.strictEqual(capturedRpc.params.p_seconds, 0);
+
+  mock.restoreAll();
+});
+

@@ -8,7 +8,35 @@ process.env.SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ||
 const { supabaseAdmin } = require('../lib/supabaseClient');
 const { runCommitModeMidnightSweep } = require('../lib/commitModeEnforcer');
 
-test('runCommitModeMidnightSweep: empty active users returns 0 checked, 0 terminated, 0 kept', async () => {
+function createDummySingleQueryMock() {
+  return {
+    select: () => ({
+      eq: () => ({
+        eq: () => ({
+          eq: () => ({
+            order: () => ({
+              limit: () => ({
+                maybeSingle: () => Promise.resolve({ data: null, error: null })
+              })
+            })
+          }),
+          order: () => ({
+            limit: () => ({
+              maybeSingle: () => Promise.resolve({ data: null, error: null })
+            })
+          })
+        }),
+        order: () => ({
+          limit: () => ({
+            maybeSingle: () => Promise.resolve({ data: null, error: null })
+          })
+        })
+      })
+    })
+  };
+}
+
+test('runCommitModeMidnightSweep: empty active users returns 0 checked, 0 terminated, 0 kept, 0 skipped', async () => {
   mock.method(supabaseAdmin, 'from', (table) => {
     assert.strictEqual(table, 'profiles');
     return {
@@ -26,6 +54,7 @@ test('runCommitModeMidnightSweep: empty active users returns 0 checked, 0 termin
   assert.strictEqual(result.checked, 0);
   assert.strictEqual(result.terminated, 0);
   assert.strictEqual(result.kept, 0);
+  assert.strictEqual(result.skipped, 0);
   mock.restoreAll();
 });
 
@@ -60,6 +89,10 @@ test('runCommitModeMidnightSweep: multi-page pagination visits all users across 
         }
       };
       return builder;
+    }
+
+    if (table === 'payments' || table === 'commit_mode_consents') {
+      return createDummySingleQueryMock();
     }
 
     if (table === 'commit_mode_daily_progress') {
@@ -101,6 +134,7 @@ test('runCommitModeMidnightSweep: multi-page pagination visits all users across 
   assert.strictEqual(result.checked, 250);
   assert.strictEqual(result.kept, 250);
   assert.strictEqual(result.terminated, 0);
+  assert.strictEqual(result.skipped, 0);
   assert.strictEqual(queriedIds.length, 250);
   assert.strictEqual(queriedIds[0], 'user-0001');
   assert.strictEqual(queriedIds[249], 'user-0250');
@@ -129,6 +163,10 @@ test('runCommitModeMidnightSweep: single user failure does not abort pagination 
         })
       };
       return builder;
+    }
+
+    if (table === 'payments' || table === 'commit_mode_consents') {
+      return createDummySingleQueryMock();
     }
 
     if (table === 'commit_mode_daily_progress') {
@@ -172,5 +210,7 @@ test('runCommitModeMidnightSweep: single user failure does not abort pagination 
   assert.strictEqual(result.checked, 3);
   assert.strictEqual(result.kept, 1);
   assert.strictEqual(result.terminated, 1); // user-003 missed requirements -> terminated
+  assert.strictEqual(result.skipped, 0);
   mock.restoreAll();
 });
+

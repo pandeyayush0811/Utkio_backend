@@ -14,7 +14,7 @@ function requirePlan(kind) {
   return async function (req, res, next) {
     try {
       if (!supabaseAdmin) {
-        return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+        return res.status(500).json({ error: 'Server configuration error. Please try again later.' });
       }
 
       const { data, error } = await supabaseAdmin.rpc('consume_access', {

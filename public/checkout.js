@@ -18,7 +18,7 @@
     cardEl.innerHTML =
       '<div class="logo">Utkio</div>' +
       '<div class="msg err" style="margin-top:16px;">' + esc(text) + '</div>' +
-      '<div class="sub" style="margin-top:10px;">App par wapas jaakar dobara try karo.</div>';
+      '<div class="sub" style="margin-top:10px;">Please return to the Utkio app and try again.</div>';
   }
 
   function renderSuccess(planLabel) {
@@ -27,7 +27,7 @@
       '<svg class="success-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>' +
       '<div class="plan-name" style="margin-top:14px;">Payment successful!</div>' +
       '<div class="sub">' + esc(planLabel) + ' plan is now active.</div>' +
-      '<div class="sub" style="margin-top:18px;">Ab is tab ko band karke Utkio app par wapas jao.</div>';
+      '<div class="sub" style="margin-top:18px;">You can now close this tab and return to the Utkio app.</div>';
   }
 
   function renderOrder(order) {
@@ -37,7 +37,7 @@
       '<div class="logo">Utkio</div>' +
       '<div class="plan-name">Utkio ' + esc(planLabel) + '</div>' +
       '<div class="amount">\u20B9' + esc(rupees) + '</div>' +
-      '<div class="sub">30 din ke liye</div>' +
+      '<div class="sub">Valid for 30 days</div>' +
       '<button id="payBtn">Pay \u20B9' + esc(rupees) + '</button>' +
       '<div class="msg" id="msg"></div>';
 
@@ -49,7 +49,7 @@
   function startPayment(order, planLabel) {
     if (typeof Razorpay === 'undefined') {
       const msg = document.getElementById('msg');
-      msg.textContent = 'Payment SDK load nahi ho paya — internet check karke page reload karo.';
+      msg.textContent = 'Payment system could not load. Please check your internet connection and reload the page.';
       msg.className = 'msg err';
       return;
     }
@@ -65,7 +65,7 @@
       currency: order.currency,
       order_id: order.order_id,
       name: 'Utkio',
-      description: 'Utkio ' + planLabel + ' \u2014 30 din',
+      description: 'Utkio ' + planLabel + ' \u2014 30 days',
       theme: { color: '#6a63f1' },
       handler: async function (response) {
         msg.textContent = 'Verifying payment...';
@@ -83,7 +83,7 @@
           // server, independent of this tab) still activates the plan
           // shortly even if this verify call itself failed. Don't scare
           // the user into re-paying.
-          msg.textContent = 'Payment ho gaya! Plan activate hone mein thoda time lag sakta hai. App par wapas jaakar thodi der mein check karo.';
+          msg.textContent = 'Payment completed! Your plan will activate shortly. Please return to the Utkio app.';
           msg.className = 'msg ok';
           payBtn.style.display = 'none';
         }
@@ -96,7 +96,7 @@
     });
 
     rzp.on('payment.failed', function (resp) {
-      msg.textContent = 'Payment fail ho gaya: ' + (resp.error && resp.error.description ? resp.error.description : 'try again');
+      msg.textContent = 'Payment could not be completed. Please try again or use another payment method.';
       msg.className = 'msg err';
       payBtn.disabled = false;
     });
@@ -113,7 +113,7 @@
     // misconfig, ad-blocker, offline CDN) we want a visible error
     // instead of silently sitting at "Loading your order...".
     if (typeof Razorpay === 'undefined') {
-      renderError('Payment SDK load nahi ho paya. Internet check karke reload karo.');
+      renderError('Payment system could not load. Please check your internet connection and reload the page.');
       return;
     }
     try {
@@ -125,7 +125,7 @@
       }
       renderOrder(data);
     } catch (e) {
-      renderError('Server se connect nahi ho pa raha. Internet check karo aur reload karo.');
+      renderError('Could not connect to the server. Please check your internet connection and reload.');
     }
   }
 
@@ -134,7 +134,7 @@
   // error instead of an infinite spinner.
   window.addEventListener('error', function () {
     if (cardEl && cardEl.querySelector('.spinner')) {
-      renderError('Kuch gadbad hui page load karte waqt. Reload karo.');
+      renderError('Something went wrong while loading the checkout page. Please reload.');
     }
   });
 

@@ -153,7 +153,7 @@ function buildProfileUpdate(body, { partial }) {
 router.post('/onboarding', requireAuth, async (req, res, next) => {
   try {
     if (!supabaseAdmin) {
-      return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+      return res.status(500).json({ error: 'Server configuration error. Please try again later.' });
     }
 
     const { updateObj, error: validationError } = buildProfileUpdate(req.body, { partial: false });
@@ -179,7 +179,7 @@ router.post('/onboarding', requireAuth, async (req, res, next) => {
 router.patch('/profile', requireAuth, async (req, res, next) => {
   try {
     if (!supabaseAdmin) {
-      return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+      return res.status(500).json({ error: 'Server configuration error. Please try again later.' });
     }
 
     const { updateObj, error: validationError } = buildProfileUpdate(req.body, { partial: true });

@@ -15,7 +15,7 @@ const { pickTodaysScenario, startOfIstDay } = require('../lib/scenarioSelector')
 // client check is UX, the server check is the boundary).
 router.get('/today', requireAuth, async (req, res, next) => {
   try {
-    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Server configuration error. Please try again later.' });
 
     const { data: activeScenarios, error: scenariosErr } = await supabaseAdmin
       .from('scenario_configs')

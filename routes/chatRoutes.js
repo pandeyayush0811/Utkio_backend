@@ -20,6 +20,10 @@ const MAX_MESSAGES_PER_SESSION = 500; // sanity cap — a normal session is a fe
 // redeploy — just update ANALYSIS_MODEL in the environment and restart.
 const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL || 'gpt-4.1';
 
+// OpenAI request timeout in ms (defaults to 45s, well under 60-100s reverse
+// proxy timeouts and 3m STALE_CLAIM_MS). Overridable via OPENAI_TIMEOUT_MS env var.
+const OPENAI_TIMEOUT_MS = parseInt(process.env.OPENAI_TIMEOUT_MS, 10) || 45000;
+
 // A claimed-but-unfinished report row (see the atomic-claim comment on
 // POST /sessions/:id/analyze below) should normally resolve in 10-20s.
 // If the server crashes/restarts in that exact window, the `res.once
@@ -60,7 +64,7 @@ function validateMessages(messages) {
 // the history list loads fast even with lots of past sessions.
 router.get('/sessions', requireAuth, async (req, res, next) => {
   try {
-    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Server configuration error. Please try again later.' });
 
     const { data, error } = await supabaseAdmin
       .from('chat_sessions')
@@ -88,7 +92,7 @@ router.get('/sessions', requireAuth, async (req, res, next) => {
 // read) and by chat.html when resuming (to seed Bolo's memory).
 router.get('/sessions/:id', requireAuth, async (req, res, next) => {
   try {
-    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Server configuration error. Please try again later.' });
 
     const { id } = req.params;
 
@@ -133,7 +137,7 @@ router.get('/sessions/:id', requireAuth, async (req, res, next) => {
 // just gets harmless all-false zeros back, not an error.
 router.get('/commit-mode/today', requireAuth, async (req, res, next) => {
   try {
-    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Server configuration error. Please try again later.' });
     const progress = await getTodaysCommitModeProgress(req.user.id);
     res.json(progress);
   } catch (err) { next(err); }
@@ -142,7 +146,7 @@ router.get('/commit-mode/today', requireAuth, async (req, res, next) => {
 // GET /chat/streak — returns the user's real calculated day streak (in IST).
 router.get('/streak', requireAuth, async (req, res, next) => {
   try {
-    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Server configuration error. Please try again later.' });
     const streak = await getUserStreak(req.user.id);
     res.json(streak);
   } catch (err) { next(err); }
@@ -156,7 +160,7 @@ router.get('/streak', requireAuth, async (req, res, next) => {
 //                        ended_at + turn_count get updated)
 router.post('/sessions', requireAuth, async (req, res, next) => {
   try {
-    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Server configuration error. Please try again later.' });
 
     // session_type/scenario_key are new, optional fields (see
     // sql/migrations/006_scenario_simulation.sql) — a freeform chat.html
@@ -174,40 +178,62 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
     if (sessionTypeCheck.error) return res.status(400).json({ error: sessionTypeCheck.error });
     const resolvedSessionType = sessionTypeCheck.resolvedSessionType;
 
+    // Server-side enforcement of "one scenario per day" — only applies to brand-new scenario sessions:
+    // resuming an already-started one (session_id set) is a continuation of the SAME day's attempt,
+    // not a new one, so it's exempt.
+    if (!session_id && resolvedSessionType === 'scenario') {
+      const todayStart = startOfIstDay(new Date()).toISOString();
+      const { data: todaysScenarioSession, error: todayCheckErr } = await supabaseAdmin
+        .from('chat_sessions')
+        .select('id')
+        .eq('user_id', req.user.id)
+        .eq('session_type', 'scenario')
+        .gt('turn_count', 0)
+        .gte('started_at', todayStart)
+        .limit(1)
+        .maybeSingle();
+      if (todayCheckErr) return next(todayCheckErr);
+      if (todaysScenarioSession) {
+        return res.status(409).json({
+          error: 'scenario_already_done_today',
+          message: "Today's scenario is already complete — a new scenario will be available tomorrow.",
+          session_id: todaysScenarioSession.id
+        });
+      }
+    }
+
+    // Check for write idempotency: if session_id is omitted, check if a session for this user
+    // with the exact same started_at timestamp already exists (e.g. concurrent sync from pagehide /
+    // history load, or network retry). If found, resolve to that session ID to prevent duplicate
+    // rows and prevent double credit consumption.
+    let effectiveSessionId = session_id || null;
+    if (!effectiveSessionId && supabaseAdmin && typeof supabaseAdmin.from === 'function') {
+      try {
+        const sessionQuery = supabaseAdmin.from('chat_sessions');
+        if (sessionQuery && typeof sessionQuery.select === 'function') {
+          const queryResult = sessionQuery
+            .select('id')
+            .eq('user_id', req.user.id)
+            .eq('started_at', started_at);
+          if (queryResult && typeof queryResult.maybeSingle === 'function') {
+            const { data: existingSession, error: checkErr } = await queryResult.maybeSingle();
+            if (!checkErr && existingSession && existingSession.id && existingSession.id !== 'aborted-0-turn') {
+              effectiveSessionId = existingSession.id;
+            }
+          }
+        }
+      } catch (_) {}
+    }
+
     // Function to handle the actual database insertion / resume once plan check passes (or is bypassed for resumes)
     const handleSessionSave = async () => {
       try {
-        // Server-side enforcement of "one scenario per day" — only
-        // applies to brand-new scenario sessions: resuming an
-        // already-started one (session_id set) is a continuation of the
-        // SAME day's attempt, not a new one, so it's exempt.
-        if (!session_id && resolvedSessionType === 'scenario') {
-          const todayStart = startOfIstDay(new Date()).toISOString();
-          const { data: todaysScenarioSession, error: todayCheckErr } = await supabaseAdmin
-            .from('chat_sessions')
-            .select('id')
-            .eq('user_id', req.user.id)
-            .eq('session_type', 'scenario')
-            .gt('turn_count', 0)
-            .gte('started_at', todayStart)
-            .limit(1)
-            .maybeSingle();
-          if (todayCheckErr) return next(todayCheckErr);
-          if (todaysScenarioSession) {
-            return res.status(409).json({
-              error: 'scenario_already_done_today',
-              message: 'Aaj ka scenario already complete ho chuka hai — kal ek naya milega.',
-              session_id: todaysScenarioSession.id
-            });
-          }
-        }
-
-        // ---- Resume mode: append to an existing session ----
-        if (session_id) {
+        // ---- Resume / Idempotent sync mode: append to an existing session ----
+        if (effectiveSessionId) {
           const { data: existing, error: existErr } = await supabaseAdmin
             .from('chat_sessions')
             .select('id, turn_count, ended_at')
-            .eq('id', session_id)
+            .eq('id', effectiveSessionId)
             .eq('user_id', req.user.id) // ownership check
             .single();
 
@@ -223,43 +249,57 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
           const { data: reportRow } = await supabaseAdmin
             .from('session_reports')
             .select('id')
-            .eq('session_id', session_id)
+            .eq('session_id', effectiveSessionId)
             .eq('user_id', req.user.id)
             .maybeSingle();
           if (reportRow) {
-            return res.status(409).json({ error: 'locked', message: 'Iss chat ka report ban chuka hai — ab isme naye messages nahi jud sakte. Naya chat shuru karo.' });
+            return res.status(409).json({ error: 'locked', message: 'This chat already has an analysis report. Please start a new chat to continue.' });
           }
 
-          const startIndex = existing.turn_count;
-          const rows = messages.map((m, i) => ({
-            session_id,
-            role: m.role,
-            content: m.content.trim(),
-            turn_index: startIndex + i
-          }));
+          let rows;
+          let newTurnCount;
+          if (session_id) {
+            const startIndex = existing.turn_count;
+            rows = messages.map((m, i) => ({
+              session_id: effectiveSessionId,
+              role: m.role,
+              content: m.content.trim(),
+              turn_index: startIndex + i
+            }));
+            newTurnCount = startIndex + rows.length;
+          } else {
+            rows = messages.map((m, i) => ({
+              session_id: effectiveSessionId,
+              role: m.role,
+              content: m.content.trim(),
+              turn_index: i
+            }));
+            newTurnCount = Math.max(existing.turn_count || 0, rows.length);
+          }
 
           const { error: insertErr } = await supabaseAdmin
             .from('chat_messages')
             .upsert(rows, { onConflict: 'session_id,turn_index', ignoreDuplicates: true });
           if (insertErr) return next(insertErr); // 5xx internals stay server-side only — see errorHandler.js
 
-          const newTurnCount = startIndex + rows.length;
           const { error: updateErr } = await supabaseAdmin
             .from('chat_sessions')
             .update({ ended_at, turn_count: newTurnCount })
-            .eq('id', session_id);
+            .eq('id', effectiveSessionId);
 
           if (updateErr) return next(updateErr);
 
-          // Commit Mode progress: only meaningful for freeform ('chat') sessions.
+          // Commit Mode progress: freeform ('chat') or scenario sessions.
           // Resumed session progress uses the actual elapsed duration of this leg (ended_at - started_at)
           // instead of the multi-day wall-clock gap from previous leg's ended_at.
           if (resolvedSessionType === 'freeform') {
             const legSeconds = Math.max(0, (new Date(ended_at) - new Date(started_at)) / 1000);
             recordCommitModeProgress({ userId: req.user.id, kind: 'chat', seconds: legSeconds, at: new Date(ended_at) });
+          } else if (resolvedSessionType === 'scenario') {
+            recordCommitModeProgress({ userId: req.user.id, kind: 'scenario', seconds: 0, at: new Date(ended_at) });
           }
 
-          return res.json({ session_id, turn_count: newTurnCount });
+          return res.json({ session_id: effectiveSessionId, turn_count: newTurnCount });
         }
 
         // ---- Normal mode: brand new session ----
@@ -291,15 +331,17 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
         if (resolvedSessionType === 'freeform') {
           const durationSeconds = (new Date(ended_at) - new Date(started_at)) / 1000;
           recordCommitModeProgress({ userId: req.user.id, kind: 'chat', seconds: durationSeconds, at: new Date(ended_at) });
+        } else if (resolvedSessionType === 'scenario') {
+          recordCommitModeProgress({ userId: req.user.id, kind: 'scenario', seconds: 0, at: new Date(ended_at) });
         }
 
         return res.json({ session_id: session.id, turn_count: session.turn_count });
       } catch (err) { next(err); }
     };
 
-    // Resuming an existing session is a continuation of an already-started session and does not consume a new chat credit.
+    // Resuming an existing session (or syncing an already created session) is a continuation of an already-started session and does not consume a new chat credit.
     // Brand new sessions require active plan / free trial credit.
-    if (session_id) {
+    if (effectiveSessionId) {
       await handleSessionSave();
     } else {
       const planKind = resolvedSessionType === 'scenario' ? 'scenario' : 'chat';
@@ -313,7 +355,7 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
 // has ON DELETE CASCADE), so we only need to touch chat_sessions here.
 router.delete('/sessions', requireAuth, async (req, res, next) => {
   try {
-    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Server configuration error. Please try again later.' });
 
     const { error } = await supabaseAdmin.from('chat_sessions').delete().eq('user_id', req.user.id);
     if (error) return next(error); // 5xx internals stay server-side only — see errorHandler.js
@@ -400,7 +442,7 @@ const REPORT_COLUMNS = 'id, session_id, report_text, model_version, generated_at
 // decide whether to show "See report" or "Generate report".
 router.get('/sessions/:id/report', requireAuth, async (req, res, next) => {
   try {
-    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Server configuration error. Please try again later.' });
 
     const { data, error } = await supabaseAdmin
       .from('session_reports')
@@ -440,8 +482,8 @@ router.get('/sessions/:id/report', requireAuth, async (req, res, next) => {
 // report once OpenAI responds.
 router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
   try {
-    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
-    if (!process.env.OPENAI_API_KEY) return res.status(500).json({ error: 'Server misconfigured: OPENAI_API_KEY missing.' });
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Server configuration error. Please try again later.' });
+    if (!process.env.OPENAI_API_KEY) return res.status(500).json({ error: 'Server configuration error. Please try again later.' });
 
     const sessionId = req.params.id;
 
@@ -474,7 +516,7 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
       if (claimAgeMs < STALE_CLAIM_MS) {
         return res.status(409).json({
           error: 'report_in_progress',
-          message: 'Report already generate ho raha hai — thoda ruko.'
+          message: 'Report is currently being generated — please wait a moment.'
         });
       }
       console.warn(`[analyze] Reclaiming stale report claim for session ${sessionId} (${Math.round(claimAgeMs / 1000)}s old) — previous attempt likely crashed.`);
@@ -511,7 +553,7 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
       if (claimErr.code === '23505') { // unique_violation — someone else won the race
         return res.status(409).json({
           error: 'report_in_progress',
-          message: 'Report already generate ho raha hai — thoda ruko.'
+          message: 'Report is currently being generated — please wait a moment.'
         });
       }
       return next(claimErr);
@@ -559,7 +601,11 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
         const transcript = messages.map(m => (m.role === 'user' ? 'User' : 'Bolo') + ': ' + m.content).join('\n');
         const systemPrompt = (await getAnalysisPrompt()) + buildPersonalizationBlock(profile);
 
-        const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+        const openai = new OpenAI({
+          apiKey: process.env.OPENAI_API_KEY,
+          timeout: OPENAI_TIMEOUT_MS,
+          maxRetries: 1
+        });
         const model = ANALYSIS_MODEL;
 
         let rawText;
@@ -573,9 +619,20 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
             // No response_format here on purpose — the new prompt asks
             // for a natural free-text write-up, not JSON. Forcing a JSON
             // schema would fight that instruction.
-          });
+          }, { timeout: OPENAI_TIMEOUT_MS });
           rawText = response.choices[0].message.content;
         } catch (aiErr) {
+          const isTimeout = aiErr?.name === 'APIConnectionTimeoutError' ||
+                            aiErr?.name === 'AbortError' ||
+                            aiErr?.code === 'ETIMEDOUT' ||
+                            aiErr?.type === 'request_timeout';
+
+          if (isTimeout) {
+            console.warn(`[analyze] OpenAI report generation timed out after ${OPENAI_TIMEOUT_MS}ms for session ${sessionId}`);
+            await refundTrialReportCredit(req.user.id);
+            return res.status(504).json({ error: 'Analysis timed out — please try again.' });
+          }
+
           console.error('Analysis LLM call failed:', aiErr);
           await refundTrialReportCredit(req.user.id);
           return res.status(502).json({ error: 'Analysis failed — please try again.' });
@@ -621,3 +678,4 @@ module.exports.validateSessionType = validateSessionType; // exported for tests 
 module.exports.refundTrialReportCredit = refundTrialReportCredit; // exported for tests only
 module.exports.MIN_TURNS_FOR_ANALYSIS = MIN_TURNS_FOR_ANALYSIS; // exported for tests only
 module.exports.MIN_SCENARIO_TURNS_FOR_ANALYSIS = MIN_SCENARIO_TURNS_FOR_ANALYSIS; // exported for tests only
+module.exports.OPENAI_TIMEOUT_MS = OPENAI_TIMEOUT_MS; // exported for tests only

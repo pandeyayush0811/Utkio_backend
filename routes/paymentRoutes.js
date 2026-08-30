@@ -35,7 +35,7 @@ async function requireCommitModeConsentOrRespond(req, res, plan) {
   if (!consent) {
     res.status(402).json({
       error: 'commit_mode_consent_required',
-      message: 'Commit Mode lene se pehle rules wala disclosure dekhna aur agree karna zaroori hai.',
+      message: 'Please review and agree to the Commit Mode rules before purchasing.',
       disclosure_version: COMMIT_MODE_DISCLOSURE_VERSION
     });
     return { skip: false, consent: null };
@@ -49,8 +49,8 @@ async function requireCommitModeConsentOrRespond(req, res, plan) {
 // ═══════════════════════════════════════════════════════════════
 router.post('/create-order', requireAuth, async (req, res, next) => {
   try {
-    if (!razorpay) return res.status(500).json({ error: 'Payments not configured on server.' });
-    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+    if (!razorpay) return res.status(500).json({ error: 'Payment service is temporarily unavailable. Please try again later.' });
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Payment service is temporarily unavailable. Please try again later.' });
 
     const { plan } = req.body;
     if (!plan || !PLAN_PRICES_PAISE[plan]) {
@@ -142,7 +142,7 @@ router.post('/create-order', requireAuth, async (req, res, next) => {
 // ═══════════════════════════════════════════════════════════════
 router.post('/commit-mode/consent', requireAuth, async (req, res, next) => {
   try {
-    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Server configuration error. Please try again later.' });
     const consent = await recordConsent(req.user.id);
     res.json({ consented_at: consent.consented_at, disclosure_version: COMMIT_MODE_DISCLOSURE_VERSION });
   } catch (err) { next(err); }
@@ -164,14 +164,14 @@ router.post('/commit-mode/consent', requireAuth, async (req, res, next) => {
 // ═══════════════════════════════════════════════════════════════
 router.post('/verify', requireAuth, async (req, res, next) => {
   try {
-    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Payment service is temporarily unavailable. Please try again later.' });
 
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
       return res.status(400).json({ error: 'razorpay_order_id, razorpay_payment_id and razorpay_signature are all required' });
     }
     if (!process.env.RAZORPAY_KEY_SECRET) {
-      return res.status(500).json({ error: 'Payments not configured on server.' });
+      return res.status(500).json({ error: 'Payment service is temporarily unavailable. Please try again later.' });
     }
 
     // Razorpay's own signature scheme for this callback: HMAC-SHA256 of
@@ -301,8 +301,8 @@ const CHECKOUT_TOKEN_TTL_MS = 15 * 60 * 1000; // 15 minutes — plenty for a che
 
 router.post('/checkout/init', requireAuth, async (req, res, next) => {
   try {
-    if (!razorpay) return res.status(500).json({ error: 'Payments not configured on server.' });
-    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+    if (!razorpay) return res.status(500).json({ error: 'Payment service is temporarily unavailable. Please try again later.' });
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Payment service is temporarily unavailable. Please try again later.' });
 
     const { plan } = req.body;
     if (!plan || !PLAN_PRICES_PAISE[plan]) {
@@ -427,7 +427,7 @@ async function resolveCheckoutToken(token) {
 // token itself IS the auth, scoped to exactly one pending order).
 router.get('/checkout/:token', async (req, res, next) => {
   try {
-    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured.' });
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Payment service is temporarily unavailable. Please try again later.' });
 
     const resolved = await resolveCheckoutToken(req.params.token);
     if (!resolved) return res.status(410).json({ error: 'This checkout link has expired or was already used. Go back to the app and try again.' });
@@ -447,8 +447,8 @@ router.get('/checkout/:token', async (req, res, next) => {
 // right after Razorpay's widget reports success in the browser.
 router.post('/checkout/:token/verify', async (req, res, next) => {
   try {
-    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured.' });
-    if (!process.env.RAZORPAY_KEY_SECRET) return res.status(500).json({ error: 'Payments not configured on server.' });
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Payment service is temporarily unavailable. Please try again later.' });
+    if (!process.env.RAZORPAY_KEY_SECRET) return res.status(500).json({ error: 'Payment service is temporarily unavailable. Please try again later.' });
 
     const resolved = await resolveCheckoutToken(req.params.token);
     if (!resolved) return res.status(410).json({ error: 'This checkout link has expired or was already used.' });
@@ -492,7 +492,7 @@ router.post('/checkout/:token/verify', async (req, res, next) => {
 // ═══════════════════════════════════════════════════════════════
 router.get('/status', requireAuth, async (req, res, next) => {
   try {
-    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Server configuration error. Please try again later.' });
 
     const { data, error } = await supabaseAdmin
       .from('profiles')
@@ -563,7 +563,7 @@ router.get('/status', requireAuth, async (req, res, next) => {
 // ═══════════════════════════════════════════════════════════════
 router.post('/unlimited/waitlist', requireAuth, async (req, res, next) => {
   try {
-    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Server configuration error. Please try again later.' });
 
     const { error } = await supabaseAdmin
       .from('unlimited_waitlist')
@@ -576,7 +576,7 @@ router.post('/unlimited/waitlist', requireAuth, async (req, res, next) => {
 
 router.get('/unlimited/waitlist', requireAuth, async (req, res, next) => {
   try {
-    if (!supabaseAdmin) return res.status(500).json({ error: 'Server misconfigured: SUPABASE_SERVICE_ROLE_KEY missing.' });
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Server configuration error. Please try again later.' });
 
     const { data, error } = await supabaseAdmin
       .from('unlimited_waitlist')
