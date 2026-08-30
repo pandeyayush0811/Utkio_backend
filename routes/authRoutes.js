@@ -107,6 +107,44 @@ router.post('/signup/otp', async (req, res, next) => {
       });
     }
 
+    if (supabaseAdmin) {
+      const { data: existingEmailUser, error: emailCheckError } = await supabaseAdmin
+        .from('profiles')
+        .select('id')
+        .eq('email', email)
+        .limit(1)
+        .maybeSingle();
+
+      if (emailCheckError) {
+        console.error('signup/otp: email existence check failed:', emailCheckError.message);
+      }
+
+      if (existingEmailUser) {
+        return res.status(409).json({
+          error: 'An account with this email already exists. Please log in.',
+          code: 'account_exists'
+        });
+      }
+
+      const { data: existingPhoneUser, error: phoneCheckError } = await supabaseAdmin
+        .from('profiles')
+        .select('id')
+        .eq('phone', phone)
+        .limit(1)
+        .maybeSingle();
+
+      if (phoneCheckError) {
+        console.error('signup/otp: phone existence check failed:', phoneCheckError.message);
+      }
+
+      if (existingPhoneUser) {
+        return res.status(409).json({
+          error: 'An account with this mobile number already exists. Please log in.',
+          code: 'account_exists'
+        });
+      }
+    }
+
     const { error } = await supabaseAnon.auth.signInWithOtp({
       email,
       options: { shouldCreateUser: true }
@@ -153,6 +191,26 @@ router.post('/signup/verify', async (req, res, next) => {
       console.error('signup/verify: SUPABASE_SERVICE_ROLE_KEY not set — cannot set password.');
       return res.status(500).json({ error: 'Signup is temporarily unavailable. Please try again later.' });
     }
+
+    const { data: phoneConflict, error: phoneConflictError } = await supabaseAdmin
+      .from('profiles')
+      .select('id')
+      .eq('phone', phone)
+      .neq('id', data.user.id)
+      .limit(1)
+      .maybeSingle();
+
+    if (phoneConflictError) {
+      console.error('signup/verify: phone conflict check failed:', phoneConflictError.message);
+    }
+
+    if (phoneConflict) {
+      return res.status(409).json({
+        error: 'This mobile number is already linked to another account.',
+        code: 'phone_exists'
+      });
+    }
+
     const { error: pwSetError } = await supabaseAdmin.auth.admin.updateUserById(data.user.id, { password });
     if (pwSetError) {
       console.error('signup/verify: failed to set password:', pwSetError.message);

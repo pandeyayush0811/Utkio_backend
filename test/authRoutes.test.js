@@ -74,6 +74,15 @@ test('signup/verify accepts valid OTP and password, sets password and ensures pr
     return { error: null };
   });
   mock.method(supabaseAdmin, 'from', () => ({
+    select: () => ({
+      eq: () => ({
+        neq: () => ({
+          limit: () => ({
+            maybeSingle: async () => ({ data: null, error: null })
+          })
+        })
+      })
+    }),
     upsert: async () => ({ error: null })
   }));
 
@@ -97,6 +106,15 @@ test('signup/verify falls back to signInWithPassword to guarantee an active sess
   }));
   mock.method(supabaseAdmin.auth.admin, 'updateUserById', async () => ({ error: null }));
   mock.method(supabaseAdmin, 'from', () => ({
+    select: () => ({
+      eq: () => ({
+        neq: () => ({
+          limit: () => ({
+            maybeSingle: async () => ({ data: null, error: null })
+          })
+        })
+      })
+    }),
     upsert: async () => ({ error: null })
   }));
   mock.method(supabaseAnon.auth, 'signInWithPassword', async ({ email, password }) => {
@@ -260,3 +278,136 @@ test('resolveToEmail: queries profiles ordered by created_at desc for valid Indi
 
   mock.restoreAll();
 });
+
+test('AUD-032: POST /auth/signup/otp rejects existing email with 409 and account_exists code', async () => {
+  mock.method(supabaseAdmin, 'from', (table) => {
+    assert.strictEqual(table, 'profiles');
+    return {
+      select: () => ({
+        eq: (col, val) => ({
+          limit: () => ({
+            maybeSingle: async () => {
+              if (col === 'email' && val === 'existing@example.com') {
+                return { data: { id: 'existing-u1' }, error: null };
+              }
+              return { data: null, error: null };
+            }
+          })
+        })
+      })
+    };
+  });
+
+  const app = buildApp();
+  const { status, data } = await post(app, '/auth/signup/otp', {
+    email: 'existing@example.com',
+    phone: '9876543210'
+  });
+
+  assert.strictEqual(status, 409);
+  assert.strictEqual(data.code, 'account_exists');
+  assert.match(data.error, /already exists/);
+
+  mock.restoreAll();
+});
+
+test('AUD-032: POST /auth/signup/otp rejects existing mobile number with 409 and account_exists code', async () => {
+  mock.method(supabaseAdmin, 'from', (table) => {
+    assert.strictEqual(table, 'profiles');
+    return {
+      select: () => ({
+        eq: (col, val) => ({
+          limit: () => ({
+            maybeSingle: async () => {
+              if (col === 'phone' && (val === '9876543210' || val === '+919876543210')) {
+                return { data: { id: 'existing-u2' }, error: null };
+              }
+              return { data: null, error: null };
+            }
+          })
+        })
+      })
+    };
+  });
+
+  const app = buildApp();
+  const { status, data } = await post(app, '/auth/signup/otp', {
+    email: 'newuser@example.com',
+    phone: '9876543210'
+  });
+
+  assert.strictEqual(status, 409);
+  assert.strictEqual(data.code, 'account_exists');
+  assert.match(data.error, /already exists/);
+
+  mock.restoreAll();
+});
+
+test('AUD-032: POST /auth/signup/verify rejects phone number collision with another user account (409 phone_exists)', async () => {
+  mock.method(supabaseAnon.auth, 'verifyOtp', async () => ({
+    data: { user: { id: 'new-u1', email: 'user@example.com' }, session: { access_token: 'tok' } },
+    error: null
+  }));
+
+  mock.method(supabaseAdmin, 'from', () => ({
+    select: () => ({
+      eq: (col1, val1) => ({
+        neq: (col2, val2) => ({
+          limit: () => ({
+            maybeSingle: async () => {
+              if (col1 === 'phone' && (val1 === '9876543210' || val1 === '+919876543210') && col2 === 'id' && val2 === 'new-u1') {
+                return { data: { id: 'other-user-u99' }, error: null };
+              }
+              return { data: null, error: null };
+            }
+          })
+        })
+      })
+    })
+  }));
+
+  const app = buildApp();
+  const { status, data } = await post(app, '/auth/signup/verify', {
+    email: 'user@example.com',
+    phone: '9876543210',
+    token: '123456',
+    password: 'securepassword123'
+  });
+
+  assert.strictEqual(status, 409);
+  assert.strictEqual(data.code, 'phone_exists');
+  assert.match(data.error, /already linked to another account/);
+
+  mock.restoreAll();
+});
+
+test('AUD-032: POST /auth/signup/otp proceeds with signInWithOtp when neither email nor phone exists', async () => {
+  let otpCalledWith = null;
+  mock.method(supabaseAdmin, 'from', (table) => ({
+    select: () => ({
+      eq: () => ({
+        limit: () => ({
+          maybeSingle: async () => ({ data: null, error: null })
+        })
+      })
+    })
+  }));
+  mock.method(supabaseAnon.auth, 'signInWithOtp', async ({ email, options }) => {
+    otpCalledWith = { email, options };
+    return { error: null };
+  });
+
+  const app = buildApp();
+  const { status, data } = await post(app, '/auth/signup/otp', {
+    email: 'brandnew@example.com',
+    phone: '9876543210'
+  });
+
+  assert.strictEqual(status, 200);
+  assert.strictEqual(data.email, 'brandnew@example.com');
+  assert.deepStrictEqual(otpCalledWith, { email: 'brandnew@example.com', options: { shouldCreateUser: true } });
+
+  mock.restoreAll();
+});
+
+
