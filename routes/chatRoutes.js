@@ -68,7 +68,7 @@ router.get('/sessions', requireAuth, async (req, res, next) => {
 
     const { data, error } = await supabaseAdmin
       .from('chat_sessions')
-      .select('id, started_at, ended_at, turn_count, created_at, session_type, scenario_key')
+      .select('id, started_at, ended_at, turn_count, created_at, session_type, scenario_key, is_completed')
       .eq('user_id', req.user.id)
       .order('started_at', { ascending: false });
 
@@ -168,10 +168,11 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
     // than being required. Kept validated the same way everything else in
     // this handler is: reject before requirePlan runs, so a malformed
     // request never burns a trial credit.
-    const { session_id, started_at, ended_at, messages, session_type, scenario_key } = req.body;
+    const { session_id, started_at, ended_at, messages, session_type, scenario_key, is_completed } = req.body;
 
     if (!started_at || isNaN(Date.parse(started_at))) return res.status(400).json({ error: 'started_at must be a valid ISO timestamp' });
     if (!ended_at || isNaN(Date.parse(ended_at))) return res.status(400).json({ error: 'ended_at must be a valid ISO timestamp' });
+    if (is_completed !== undefined && typeof is_completed !== 'boolean') return res.status(400).json({ error: 'is_completed must be a boolean' });
     const msgError = validateMessages(messages);
     if (msgError) return res.status(400).json({ error: msgError });
     const sessionTypeCheck = validateSessionType(session_type, scenario_key);
@@ -282,9 +283,14 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
             .upsert(rows, { onConflict: 'session_id,turn_index', ignoreDuplicates: true });
           if (insertErr) return next(insertErr); // 5xx internals stay server-side only — see errorHandler.js
 
+          const updatePayload = { ended_at, turn_count: newTurnCount };
+          if (typeof is_completed === 'boolean') {
+            updatePayload.is_completed = is_completed;
+          }
+
           const { error: updateErr } = await supabaseAdmin
             .from('chat_sessions')
-            .update({ ended_at, turn_count: newTurnCount })
+            .update(updatePayload)
             .eq('id', effectiveSessionId);
 
           if (updateErr) return next(updateErr);
@@ -303,6 +309,10 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
         }
 
         // ---- Normal mode: brand new session ----
+        const resolvedIsCompleted = typeof is_completed === 'boolean'
+          ? is_completed
+          : (resolvedSessionType === 'scenario' ? false : true);
+
         const { data: session, error: sessionErr } = await supabaseAdmin
           .from('chat_sessions')
           .insert({
@@ -311,7 +321,8 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
             ended_at,
             turn_count: messages.length,
             session_type: resolvedSessionType,
-            scenario_key: resolvedSessionType === 'scenario' ? scenario_key : null
+            scenario_key: resolvedSessionType === 'scenario' ? scenario_key : null,
+            is_completed: resolvedIsCompleted
           })
           .select()
           .single();
@@ -528,11 +539,18 @@ router.post('/sessions/:id/analyze', requireAuth, async (req, res, next) => {
     // few turns) shouldn't cost the user a trial credit either.
     const { data: session, error: sessionErr } = await supabaseAdmin
       .from('chat_sessions')
-      .select('id, turn_count, session_type')
+      .select('id, turn_count, session_type, is_completed')
       .eq('id', sessionId)
       .eq('user_id', req.user.id)
       .single();
     if (sessionErr || !session) return res.status(404).json({ error: 'Session not found' });
+
+    // AUD-031: Incomplete scenario runs (is_completed: false) cannot be analyzed into reports
+    if (session.session_type === 'scenario' && session.is_completed === false) {
+      return res.status(400).json({
+        error: 'Scenario simulation is still in progress. Please complete the scenario before generating a report.'
+      });
+    }
 
     const minRequiredTurns = session.session_type === 'scenario'
       ? MIN_SCENARIO_TURNS_FOR_ANALYSIS

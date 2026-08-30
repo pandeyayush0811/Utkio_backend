@@ -31,6 +31,7 @@ create table if not exists chat_sessions (
   started_at timestamptz not null,
   ended_at timestamptz not null,
   turn_count int not null default 0,
+  is_completed boolean not null default true,
   created_at timestamptz default now()
 );
 
