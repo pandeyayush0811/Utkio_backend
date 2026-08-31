@@ -62,29 +62,59 @@ function validateMessages(messages) {
 // List the current user's past sessions (most recent first). Lightweight —
 // no message content here, that's a separate call (GET /sessions/:id) so
 // the history list loads fast even with lots of past sessions.
+// AUD-059: Bounded cursor pagination via `limit` and `before` query params.
 router.get('/sessions', requireAuth, async (req, res, next) => {
   try {
     if (!supabaseAdmin) return res.status(500).json({ error: 'Server configuration error. Please try again later.' });
 
-    const { data, error } = await supabaseAdmin
+    let limit = parseInt(req.query.limit, 10);
+    if (isNaN(limit) || limit < 1) limit = 20;
+    if (limit > 100) limit = 100;
+
+    const before = req.query.before;
+
+    let query = supabaseAdmin
       .from('chat_sessions')
       .select('id, started_at, ended_at, turn_count, created_at, session_type, scenario_key, is_completed')
       .eq('user_id', req.user.id)
       .order('started_at', { ascending: false });
 
+    if (before && typeof before === 'string') {
+      query = query.lt('started_at', before);
+    }
+
+    query = query.limit(limit + 1);
+
+    const { data, error } = await query;
     if (error) return next(error); // 5xx internals stay server-side only — see errorHandler.js
 
-    // One extra lightweight query to know which sessions already have a
-    // report — avoids an N+1 (one report-check call per card) on the
-    // History page.
-    const { data: reportRows } = await supabaseAdmin
-      .from('session_reports')
-      .select('session_id')
-      .eq('user_id', req.user.id);
-    const reportedIds = new Set((reportRows || []).map(r => r.session_id));
+    const rows = data || [];
+    const hasMore = rows.length > limit;
+    const sliced = hasMore ? rows.slice(0, limit) : rows;
+    const sessionIds = sliced.map(s => s.id);
 
-    const sessions = data.map(s => ({ ...s, has_report: reportedIds.has(s.id) }));
-    res.json({ sessions });
+    // One extra lightweight query scoped strictly to the returned session batch
+    // to know which sessions already have a report — avoids both N+1 and lifetime table scans.
+    let reportedIds = new Set();
+    if (sessionIds.length > 0) {
+      const { data: reportRows, error: reportErr } = await supabaseAdmin
+        .from('session_reports')
+        .select('session_id')
+        .eq('user_id', req.user.id)
+        .in('session_id', sessionIds);
+      if (!reportErr && reportRows) {
+        reportedIds = new Set(reportRows.map(r => r.session_id));
+      }
+    }
+
+    const sessions = sliced.map(s => ({ ...s, has_report: reportedIds.has(s.id) }));
+    const nextCursor = (hasMore && sessions.length > 0) ? sessions[sessions.length - 1].started_at : null;
+
+    res.json({
+      sessions,
+      has_more: hasMore,
+      next_cursor: nextCursor
+    });
   } catch (err) { next(err); }
 });
 
