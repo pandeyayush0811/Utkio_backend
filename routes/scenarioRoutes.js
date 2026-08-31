@@ -55,7 +55,7 @@ router.get('/today', requireAuth, async (req, res, next) => {
     // and it would shift to a DIFFERENT scenario mid-day — silently
     // breaking "already_completed_today" for the scenario the user
     // actually just did.
-    const lastKeyForAntiRepeat = (lastScenarioSession && lastSessionDay !== today)
+    const lastKeyForAntiRepeat = (lastScenarioSession && lastScenarioSession.is_completed !== false && lastSessionDay !== today)
       ? lastScenarioSession.scenario_key
       : null;
 
@@ -65,7 +65,7 @@ router.get('/today', requireAuth, async (req, res, next) => {
     // UTC calendar day. (No need to also compare scenario_key — since
     // the rotation is deterministic per user per day, a same-day session
     // can only be for today's scenario in the first place.)
-    const alreadyCompletedToday = lastScenarioSession != null && lastSessionDay === today;
+    const alreadyCompletedToday = lastScenarioSession != null && lastScenarioSession.is_completed !== false && lastSessionDay === today;
     const completedSessionId = alreadyCompletedToday ? lastScenarioSession.id : null;
 
     res.json({ scenario, already_completed_today: alreadyCompletedToday, completed_session_id: completedSessionId });

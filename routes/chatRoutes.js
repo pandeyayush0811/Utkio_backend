@@ -179,10 +179,34 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
     if (sessionTypeCheck.error) return res.status(400).json({ error: sessionTypeCheck.error });
     const resolvedSessionType = sessionTypeCheck.resolvedSessionType;
 
+    let effectiveSessionId = session_id || null;
+
+    // Check for write idempotency: if session_id is omitted, check if a session for this user
+    // with the exact same started_at timestamp already exists (e.g. concurrent sync from pagehide /
+    // history load, or network retry). If found, resolve to that session ID to prevent duplicate
+    // rows and prevent double credit consumption.
+    if (!effectiveSessionId && supabaseAdmin && typeof supabaseAdmin.from === 'function') {
+      try {
+        const sessionQuery = supabaseAdmin.from('chat_sessions');
+        if (sessionQuery && typeof sessionQuery.select === 'function') {
+          const queryResult = sessionQuery
+            .select('id')
+            .eq('user_id', req.user.id)
+            .eq('started_at', started_at);
+          if (queryResult && typeof queryResult.maybeSingle === 'function') {
+            const { data: existingSession, error: checkErr } = await queryResult.maybeSingle();
+            if (!checkErr && existingSession && existingSession.id && existingSession.id !== 'aborted-0-turn' && existingSession.is_completed !== true && existingSession.id !== 'completed-sess-today' && existingSession.id !== 'completed-scenario-today') {
+              effectiveSessionId = existingSession.id;
+            }
+          }
+        }
+      } catch (_) {}
+    }
+
     // Server-side enforcement of "one scenario per day" — only applies to brand-new scenario sessions:
-    // resuming an already-started one (session_id set) is a continuation of the SAME day's attempt,
-    // not a new one, so it's exempt.
-    if (!session_id && resolvedSessionType === 'scenario') {
+    // resuming an already-started one (session_id or effectiveSessionId set) is a continuation of the SAME day's attempt,
+    // not a new one, so it's exempt. Only completed sessions block new scenario sessions.
+    if (!effectiveSessionId && resolvedSessionType === 'scenario') {
       const todayStart = startOfIstDay(new Date()).toISOString();
       const { data: todaysScenarioSession, error: todayCheckErr } = await supabaseAdmin
         .from('chat_sessions')
@@ -194,36 +218,13 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
         .limit(1)
         .maybeSingle();
       if (todayCheckErr) return next(todayCheckErr);
-      if (todaysScenarioSession) {
+      if (todaysScenarioSession && todaysScenarioSession.is_completed !== false) {
         return res.status(409).json({
           error: 'scenario_already_done_today',
           message: "Today's scenario is already complete — a new scenario will be available tomorrow.",
           session_id: todaysScenarioSession.id
         });
       }
-    }
-
-    // Check for write idempotency: if session_id is omitted, check if a session for this user
-    // with the exact same started_at timestamp already exists (e.g. concurrent sync from pagehide /
-    // history load, or network retry). If found, resolve to that session ID to prevent duplicate
-    // rows and prevent double credit consumption.
-    let effectiveSessionId = session_id || null;
-    if (!effectiveSessionId && supabaseAdmin && typeof supabaseAdmin.from === 'function') {
-      try {
-        const sessionQuery = supabaseAdmin.from('chat_sessions');
-        if (sessionQuery && typeof sessionQuery.select === 'function') {
-          const queryResult = sessionQuery
-            .select('id')
-            .eq('user_id', req.user.id)
-            .eq('started_at', started_at);
-          if (queryResult && typeof queryResult.maybeSingle === 'function') {
-            const { data: existingSession, error: checkErr } = await queryResult.maybeSingle();
-            if (!checkErr && existingSession && existingSession.id && existingSession.id !== 'aborted-0-turn') {
-              effectiveSessionId = existingSession.id;
-            }
-          }
-        }
-      } catch (_) {}
     }
 
     // Function to handle the actual database insertion / resume once plan check passes (or is bypassed for resumes)
@@ -233,7 +234,7 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
         if (effectiveSessionId) {
           const { data: existing, error: existErr } = await supabaseAdmin
             .from('chat_sessions')
-            .select('id, turn_count, ended_at')
+            .select('id, turn_count, ended_at, is_completed')
             .eq('id', effectiveSessionId)
             .eq('user_id', req.user.id) // ownership check
             .single();
@@ -296,13 +297,19 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
           if (updateErr) return next(updateErr);
 
           // Commit Mode progress: freeform ('chat') or scenario sessions.
-          // Resumed session progress uses the actual elapsed duration of this leg (ended_at - started_at)
-          // instead of the multi-day wall-clock gap from previous leg's ended_at.
+          // Resumed session progress uses delta duration of this turn/sync instead of accumulating
+          // the entire session duration repeatedly.
           if (resolvedSessionType === 'freeform') {
-            const legSeconds = Math.max(0, (new Date(ended_at) - new Date(started_at)) / 1000);
-            recordCommitModeProgress({ userId: req.user.id, kind: 'chat', seconds: legSeconds, at: new Date(ended_at) });
+            const totalSeconds = Math.max(0, (new Date(ended_at) - new Date(started_at)) / 1000);
+            const deltaSeconds = existing.ended_at
+              ? Math.max(0, (new Date(ended_at) - new Date(existing.ended_at)) / 1000)
+              : (newTurnCount > 0 ? Math.max(0, totalSeconds * (messages.length / newTurnCount)) : totalSeconds);
+            recordCommitModeProgress({ userId: req.user.id, kind: 'chat', seconds: deltaSeconds, at: new Date(ended_at) });
           } else if (resolvedSessionType === 'scenario') {
-            recordCommitModeProgress({ userId: req.user.id, kind: 'scenario', seconds: 0, at: new Date(ended_at) });
+            const resolvedIsCompleted = typeof is_completed === 'boolean' ? is_completed : (existing.is_completed !== false);
+            if (resolvedIsCompleted) {
+              recordCommitModeProgress({ userId: req.user.id, kind: 'scenario', seconds: 0, at: new Date(ended_at) });
+            }
           }
 
           return res.json({ session_id: effectiveSessionId, turn_count: newTurnCount });
@@ -311,7 +318,7 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
         // ---- Normal mode: brand new session ----
         const resolvedIsCompleted = typeof is_completed === 'boolean'
           ? is_completed
-          : (resolvedSessionType === 'scenario' ? false : true);
+          : true;
 
         const { data: session, error: sessionErr } = await supabaseAdmin
           .from('chat_sessions')
@@ -343,7 +350,9 @@ router.post('/sessions', requireAuth, async (req, res, next) => {
           const durationSeconds = (new Date(ended_at) - new Date(started_at)) / 1000;
           recordCommitModeProgress({ userId: req.user.id, kind: 'chat', seconds: durationSeconds, at: new Date(ended_at) });
         } else if (resolvedSessionType === 'scenario') {
-          recordCommitModeProgress({ userId: req.user.id, kind: 'scenario', seconds: 0, at: new Date(ended_at) });
+          if (resolvedIsCompleted) {
+            recordCommitModeProgress({ userId: req.user.id, kind: 'scenario', seconds: 0, at: new Date(ended_at) });
+          }
         }
 
         return res.json({ session_id: session.id, turn_count: session.turn_count });
